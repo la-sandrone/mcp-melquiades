@@ -1,0 +1,16 @@
+# 行尾统一 LF。
+#
+# 为什么要显式声明：本项目脚本在 Linux/WSL 上跑，而作者宿主是 Windows。
+# 若贡献者 clone 时 core.autocrlf=true（Windows Git 安装器默认就是 true），
+# tools/*.sh 会被检出成 CRLF，`#!/usr/bin/env bash` 立刻变成 bad interpreter，
+# 而报错信息（`$'\r': command not found`）很难指向真因。这一条把它钉死。
+* text=auto eol=lf
+
+# 例外：Windows 批处理必须 CRLF。
+# 上面那条是**全局覆盖**，不写这个例外，将来加 .cmd/.bat 启动器会被写成 LF，
+# 在 cmd.exe 下出怪问题。声明覆盖的同时声明它的已知例外，才算把覆盖写完整。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 会话日志 fixture 是二进制 zstd，禁止任何行尾/文本转换。
+*.zstd binary

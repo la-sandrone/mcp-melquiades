@@ -1,0 +1,10 @@
+{"seq": 1, "time": 1789785600000, "type": "user/message", "data": {"turn": 1, "message": {"role": "user", "content": [{"type": "text", "text": "帮我把这次的定案记到草稿纸，顺便查一下以前有没有相关记录。"}]}}}
+{"seq": 2, "time": 1789785601000, "type": "assistant/message", "data": {"turn": 1, "message": {"role": "assistant", "content": [{"type": "reasoning", "reasoning": "先落一条，再检索旧账。"}, {"type": "text", "text": "已记录，并检索到 2 条相关旧记录。"}]}}}
+{"seq": 3, "time": 1789785602000, "type": "tool/call", "data": {"turn": 1, "name": "draftpad_write", "arguments": "{\"content\": \"定案：seq 与 guid 脱钩\", \"tags\": [\"口径\"]}"}}
+{"seq": 4, "time": 1789785603000, "type": "tool/result", "data": {"turn": 1, "message": {"role": "tool", "content": [{"type": "text", "text": "ok: id=42"}]}}}
+{"seq": 5, "time": 1789785604000, "type": "compaction/prune", "data": {"shadowedRange": {"start": 1, "end": 12}, "shadowedSeqs": [1, 2, 3], "shadowedTokenCount": 1000}}
+{"seq": 6, "time": 1789785605000, "type": "compaction/start", "data": {"compactionId": "11111111-2222-3333-4444-555555555555", "turn": 5}}
+{"seq": 7, "time": 1789785606000, "type": "compaction/summary", "data": {"compactionId": "11111111-2222-3333-4444-555555555555", "turn": 5, "shadowedSeqs": [1, 2, 3, 4], "shadowedTokenCount": 1234, "shadowedRange": {"start": 1, "end": 12}, "provider": "deepseek-official", "model": "deepseek-flash", "usage": {"inputTokens": 500, "outputTokens": 120, "cacheReadTokens": 0}, "summary": [{"type": "text", "text": "<compacted-summary>\n用户要求把定案记入草稿纸并检索旧记录；决定采用 seq→guid 指针以抵抗日志代际重编号。\n</compacted-summary>"}]}}
+{"seq": 8, "time": 1789785607000, "type": "compaction/end", "data": {"compactionId": "11111111-2222-3333-4444-555555555555", "turn": 5}}
+{"seq": 9, "time": 1789785608000, "type": "user/message", "data": {"turn": 6, "message": {"role": "user", "content": [{"type": "text", "text": "继续。"}]}}}
+{"seq": 10, "time": 1789785609000, "type": "assistant/chunk", "data": {"turn": 6, "text": "流式分片，抽取时应当被跳过。"}}

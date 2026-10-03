@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "melquiades"
+description = "MariaDB 草稿纸 + DSH 压缩档案收割 + BGE 嵌入代理（MCP 服务器）"
+readme = "README.md"
+license = { text = "AGPL-3.0-only" }
+requires-python = ">=3.10"
+authors = [{ name = "la-sandrone" }]
+keywords = ["mcp", "deepseek-harness", "dsh", "mariadb", "rag", "compaction"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: GNU Affero General Public License v3",
+  "Topic :: Database",
+  "Topic :: Text Processing :: Indexing",
+]
+# 版本唯一真相源 = melquiades/__init__.py 的 __version__（不在这里抄一份）。
+dynamic = ["version"]
+
+# ── 核心依赖（MCP 服务器本体：轻量，无需 CUDA/torch）──────────────────
+# 拆分依据（实测）：melquiades/ 包内顶层 import 只有这些；
+# 重型依赖（torch 全家桶 / fastapi）全在仓库外的 server_bge.py —— 见 embed extra。
+dependencies = [
+  "mcp>=1.26,<2",
+  "mariadb>=1.1.14",
+  "PyYAML>=6.0",
+  "httpx>=0.28",
+  "jieba>=0.42",          # 可选：缺失时 CJK FULLTEXT 自动降级
+  "sqlglot>=30",          # 可选：缺失时退回字符级门禁
+  "zstandard>=0.25",      # 可选：缺失时收割器不可用，其余功能不受影响
+  "rapidfuzz>=3.14",      # vocab.py 的同义词环（Jaro-Winkler）
+]
+
+[project.optional-dependencies]
+# 只有要自建嵌入代理（server_bge.py）才需要 —— 含 CUDA torch，安装见 README。
+embed = [
+  "sentence-transformers>=5.6",
+  "fastapi>=0.138",
+  "uvicorn>=0.42",
+]
+# 只有要预下载 BGE 模型权重才需要（download_models.py）。
+models = ["modelscope>=1.37"]
+test = ["pytest>=8"]
+
+[project.scripts]
+melquiades = "melquiades.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["melquiades*"]
+
+[tool.setuptools.dynamic]
+version = { attr = "melquiades.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

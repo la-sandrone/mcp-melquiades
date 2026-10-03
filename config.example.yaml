@@ -1,0 +1,174 @@
+# melquiades 配置文件
+# ──────────────────────────────────────────
+# MariaDB 连接
+mariadb:
+  host: 127.0.0.1
+  port: 9002
+  # ─── 库 melquiades_medicamento（梅尔基亚德斯的药物，读写）───
+  database: melquiades_medicamento
+  user: melquiades
+  password: "__CHANGE_ME__（你的 MariaDB 口令）"
+  # ─── 即弃连接（铁律一）───
+  # 无特殊理由**绝不使用长连接/连接池**：用完即烧。
+  # 理由（血教训）：长连接出错后捞不回来，且会占满连接池。
+  # 故此处不配置 pool_name / pool_size；引擎见 dbcore.MariaDB。
+  # ─── 连接超时与建立连接阶段的重试（2026-09-22 实测标定）───
+  # connect_timeout 覆盖 TCP connect + 握手 + 认证整个阶段。
+  # ★ 10 → 30 的依据：本机 127.0.0.1:9002 偶发**入向 SYN 被丢**，
+  #   TCP 重传节拍 1/3/7/15s —— 丢 1 个 ⇒ 7.14s（实测抓到 T1=7141ms），
+  #   丢 2 个 ⇒ 第 4 次重传要 15s，**10s 闸门先到 ⇒ errno 110**。
+  #   提到 30 后 15s 那次重传赶得上，实测的失败模式直接消失。
+  #   取证：tools/replay/conn_forensics.py；记录：草稿纸 id=1092。
+  #   ⚠️ 这是**容忍**（loopback 本该不丢包），不是修复。
+  connect_timeout: 30
+  # 建立连接失败的重试（用户令：三次）。**只重试建立连接阶段**——
+  # 此时一条语句都没发出，重试幂等；查询途中失败绝不自动重试（写重放会双插）。
+  connect_retries: 3
+  connect_retry_backoff_sec: 1      # 退避 = 本值 × 第几次（1s/2s/3s）
+  # 整个重试循环的总耗时预算（硬上限）。没有它最坏是 (1+3)×30 = 120 秒，
+  # 足以把一个交互式工具调用挂死两分钟。45s ⇒ 最多 2 次整超时尝试。
+  connect_retry_budget_sec: 45
+  read_timeout: 30
+  write_timeout: 30
+
+# ──────────────────────────────────────────
+# 嵌入服务（server_bge.py）
+#
+# ⚠️ 这里是**指针不是配置**：server_bge.py 不读任何配置文件（2026-09-22 核实：
+#    与 https://github.com/la-sandrone/memoria-del-hielo/server_bge.py md5 相同，
+#    只从环境变量读 SILICONFLOW_API_KEY），模型清单与限流配额**硬编码在它源文件里**：
+#      REMOTE_QUOTAS: bge-m3 与 bge-reranker-v2-m3 各 rpm=2000 / tpm=500000
+#      （令牌桶平滑补充 + 按到达顺序串行转发）
+#    权威参考实现与配置形态见 https://github.com/la-sandrone/memoria-del-hielo/config.toml。
+#
+# ★ 端口语义（读 server_bge.py 的 _should_use_local / _resolve_model_name 得到）：
+#     9005 = PORT_LOCAL_FIRST：**本地优先**，除非显式加 remote:
+#     9006 = PORT_REMOTE_FIRST：**远端优先**，除非显式加 local:
+#     `remote:xxx` / `local:xxx` = **硬覆盖**，与端口无关
+#   ⇒ 写不写前缀的区别（实测，见 tools/replay/probe_model_prefix_equiv.py）：
+#     9006 + 无前缀 → 远端（341ms）；9005 + 无前缀 → **本地（24035ms）**！
+#     9005 + remote: → 远端（95ms）。本地与远端的向量**不同**（max|Δ|=1.6e-3）。
+#   ☠ 所以「不写前缀」= 由端口决定 ⇒ **9006 挂掉回退到 9005 时会静默换后端**
+#     （向量不同、慢 150 倍）。这就是 search.bge_model 必须写 remote: 的理由。
+#     旧注释「:9005 读取超时、:9006 可用」是**误判**：9005 没坏，
+#     它默认走本地模型，本地嵌入要 24 秒才超时。
+
+# ──────────────────────────────────────────
+# 检索栈（多路 + 兜底链）
+# 端点按序尝试（成功后记忆该端点，后续优先复用）
+search:
+  bge_endpoints:
+    - "http://localhost:9006"
+    - "http://localhost:9005"
+  # ★ 必须带 remote: 前缀 —— 见上方"端口语义"。无前缀时回退到 9005 会切成本地权重。
+  #   实测：9006 上「无前缀」与「remote:」产出的向量**逐位相同**（max|Δ|=0），
+  #   故加前缀**不影响库内已有 1000+ 条向量**，可直接改。
+  bge_model: "remote:BAAI/bge-m3"
+  embedding_dim: 1024
+  fts_weight: 0.5
+  vector_weight: 0.5
+  keyword_weight: 0.3
+  # ── RRF 平滑常数：score += weight / (rrf_k + rank + 1) ──
+  # 原实现等价于 0（即 1/rank），业界默认 60。本语料实测**非单调、甜点为 10**
+  # （MRR 0.4041→0.4398；30/60 回落）⇒ 改它之前先复跑 sweep_fusion.py
+  rrf_k: 10
+  # ── 线索路（逐线索检索 + IDF 过滤 + 集成）──
+  clue_depth: 10          # 单线索召回深度，同时充当「高频线索」判定阈值
+  clue_max: 12            # 单次最多处理多少条线索（防病态长查询）
+  clue_min_chars: 2       # 清洗后短于此长度的线索直接丢弃
+  clue_weight_ratio: 0.5  # 线索路权重 = fts_weight * 本值（实测半分最佳）
+  # ── 不确定性提示阈值：前5分离度低于此值 ⇒ 提示"结果区分度低" ──
+  # 232 条实测 p25=0.316（p50=0.419）。不用 p50：分离度是连续分布非双峰，
+  # 取 0.419 会覆盖 50% 查询 ⇒ 提示泛滥＝狼来了
+  sep5_low: 0.316
+  # 模糊/语义模式（mode=vector）默认返回条数：记不清时该多看几条
+  semantic_default_limit: 10
+  uncertainty_hint: true
+  bge_connect_timeout_sec: 5
+  bge_timeout_sec: 60
+  # 受控词表查询扩展（ISO 25964-2 §24.3.2 的同义词环主用途）。只并进字面两路。
+  vocab_expand_query: true
+  # 层级扩展（skos:broader/narrower）：查 `黑洞` 连带下位词 `克尔黑洞`。
+  # ★ 默认只向下 —— 向上会把结果泛化，精度损失大于召回收益。
+  vocab_expand_hierarchy: true
+  fallback_to_like: true
+  vector_max_distance: 0
+  # ── 跨编码器精排（2026-09-22 上线，默认开；工具传 rerank=false 可单次关）──
+  # 量测依据（193 条行为标签 used，池=30，看 top-5）：
+  #   auto   hit@5 114→127（+13）、MRR 0.4331→0.5271（+0.094）
+  #   vector hit@5  98→116（+18）、MRR 0.4281→0.5327（+0.105）
+  # ★ 未进池 28/45 开关重排后**完全不动** ⇒ 重排只治"排得准"，不治"找得全"。
+  # ★ 不作用于 mode=keyword / mode=condition / auto 的 LIKE 兜底分支。
+  rerank_enabled: true
+  rerank_model: "remote:BAAI/bge-reranker-v2-m3"  # remote: 前缀必留（见 config.py 注释）
+  rerank_pool: 30          # 候选池大小，见下方实测表
+  # 池大小的实测权衡（193 条行为标签，仅 auto 路，含重排）：
+  #   pool=8  → ...（见 tools/replay/out/detail_pool*.json 复算）
+  #   pool=15 → ...
+  #   pool=30 → hit@5 127 / MRR 0.5271，p50 ≈ 1.1s
+  # 池越大排序上限越高，但**成本 ∝ 池**（一次 HTTP 调用的文档数）——改前先复跑。
+  # 按表启用。**档案表默认关** —— 理由见下方 doc_chars 注释（实测无重排信号）。
+  # 配置里**没写的表 = 不重排**；写错表名会让 Config.load 直接报错（不静默忽略）。
+  rerank_tables:
+    draftpad: true
+    dsh_compaction: false
+  # 按表的正文字数上限。缺省回退到 Hit.content 的展示宽度（= 不额外查库）。
+  # ★ draftpad = 400：实测最优，且恰等于展示宽度 ⇒ 省一次 DB 往返。
+  #   193 条行为标签、生产路径、池=30：
+  #     doc_chars=400  → hit@5 128 / MRR 0.5303 / p50  655ms   ← 最优
+  #     doc_chars=800  → hit@5 126~127 / MRR ~0.5091 / p50 2260ms
+  #     doc_chars=1200 → hit@5 123 / MRR 0.4942 / p50 3472ms
+  #   随长度单调变差（MultiConIR：重排器随文档长度衰减），成本亦随长度上涨 ⇒ 无取舍。
+  #   ☠ 踩过的坑：曾凭"取正文不能复用展示口径"的道理把默认写成 800，**没量**，
+  #     结果 MRR 掉了 0.018（= 运行间抖动 ±0.0008 的 20 倍，系统性）。
+  # ★ 为什么 dsh_compaction 直接关掉（而不是"给更大的字数"）：
+  #   档案均长 10665 字。做「查询对调」信号检验（tools/replay/probe_compaction_doc_chars.py，
+  #   34 条查询 × 池 30）——同池分别用真查询与无关查询排一遍，若重排器有信号，
+  #   真查询应系统性给池顶更高分：
+  #     doc_chars=400  → 胜率 0.53  Δ=0.034  **p=0.432**  p50 0.9s   ← 与抛硬币无异
+  #     doc_chars=1600 → 胜率 0.59  Δ=0.105  **p=0.196**  p50 11.2s  ← 不显著且贵 12 倍
+  #   ⇒ 两档都**测不出信号** ⇒ 它在噪声上重排、却覆盖权威融合序 ⇒ 关掉。
+  #     （注：早期 n=10 的版本给出"400 档胜率 0.70"，加样本后翻盘为 0.53 ——
+  #       小样本点估计不足为凭，故探针现同时报单侧二项 p 值。）
+  #   ⇒ 若将来要开：**先补档案侧标签**（现在一条都没有），别再靠调字数试。
+  rerank_doc_chars:
+    draftpad: 400
+  rerank_connect_timeout_sec: 10
+  rerank_timeout_sec: 30   # 实测 p50 ≈1.1s；量测脚本给 180s，交互工具不能挂 3 分钟
+  rerank_retries: 3
+  rerank_backoff_sec: 2
+
+# ──────────────────────────────────────────
+# DSH 压缩档案收割（三触发：定时器 / 工具搭车 / MCP 启动扫）
+dsh:
+  # ── home 不再写死版本号（2026-09-26 修）──
+  # home 名自 2026-09-26 起是【规则】：dsh-domus-<版本去前导 v>
+  #   （v0.1.7-rc.2 → dsh-domus-0.1.7-rc.2；旧名 dsh-domus 已改名退役）
+  # 所以这里只给 harness_dir，由代码读 DSH_VERSION 派生 —— 引真相源，不抄结果。
+  # 事故：写死 dsh-domus 的那版，改名当天 harvest 静默归零
+  #   （files=0/0，日志只有一句 "sessions 目录不存在"），看起来像"没有新数据"。
+  # 与 harvest/runner.discover_logs 的"不追名单，追规则"是同一哲学。
+  harness_dir: /path/to/deepseek-harness
+  home: ""          # 留空 = 由 harness_dir + DSH_VERSION 派生；填值则覆盖（逃生口）
+  sessions_dir: sessions
+  harvest_enabled: true
+  scan_interval_sec: 60
+  startup_scan_enabled: true
+  startup_scan_dirs_limit: 10
+  max_frames_per_cycle: 400
+
+# ──────────────────────────────────────────
+# 草稿纸
+draftpad:
+  default_bucket: default        # session_id 降级为 bucket（已拍板）
+
+# ──────────────────────────────────────────
+# 会话管理 —— v2 起**不再有"会话隔离/换号"**
+# session_id 降级为 bucket（见上面 draftpad.default_bucket），检索默认跨桶。
+# 旧设计的 switch_session / 旧号只读已废弃 —— 那正是"开新对话找不到之前的东西"的病根。
+
+# ──────────────────────────────────────────
+# 日志
+logging:
+  level: "INFO"        # DEBUG | INFO | WARNING | ERROR
+  format: "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
