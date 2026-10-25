@@ -1194,6 +1194,22 @@ def _start_http_bridge() -> None:
 
     if not _cfg.bridge.enabled:
         logger.info("http bridge: 已禁用（config [bridge] enabled=false）")
+        # 也写进发现文件：插件据此区分「关了」与「挂了」
+        try:
+            from .omnibus_http import write_discovery
+
+            write_discovery(
+                {
+                    "ok": False,
+                    "disabled": True,
+                    "error": "config.yaml 的 [bridge] enabled=false",
+                    "pid": os.getpid(),
+                    "host": _cfg.bridge.host,
+                    "port": _cfg.bridge.port,
+                }
+            )
+        except Exception:  # noqa: BLE001
+            pass
         return
 
     try:
@@ -1208,8 +1224,34 @@ def _start_http_bridge() -> None:
             _cfg.bridge.host,
             _cfg.bridge.port,
         )
+        _write_bridge_failure(
+            "端口 %s:%d 被占用（%s）" % (_cfg.bridge.host, _cfg.bridge.port, exc)
+        )
     except Exception as exc:  # noqa: BLE001
         logger.warning("http bridge 启动异常（%s: %s）—— MCP 继续运行", type(exc).__name__, exc)
+        _write_bridge_failure("%s: %s" % (type(exc).__name__, exc))
+
+
+def _write_bridge_failure(reason: str) -> None:
+    """把失败原因写进发现文件，让插件能把「为什么连不上」直接显示给用户。
+
+    没有这一步，插件的报错只能是「连不上」——而「端口被占」「没启用」
+    「MCP 没起」在它那边完全同形。
+    """
+    try:
+        from .omnibus_http import write_discovery
+
+        write_discovery(
+            {
+                "ok": False,
+                "error": reason,
+                "pid": os.getpid(),
+                "host": _cfg.bridge.host if _cfg else None,
+                "port": _cfg.bridge.port if _cfg else None,
+            }
+        )
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _stop_http_bridge() -> None:

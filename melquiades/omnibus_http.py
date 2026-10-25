@@ -33,11 +33,13 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import threading
 import time
 from dataclasses import asdict, is_dataclass
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any
 
 from .config import Config, default_config_path
@@ -237,17 +239,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         path = self.path.split("?", 1)[0]
         if path == "/health":
-            st = _STATE
-            self._send(
-                200,
-                {
-                    "ok": bool(st),
-                    "db": st.get("db_label"),
-                    "sources": sorted(SOURCE_SPECS),
-                    "modes": list(DEFAULT_MODES),
-                    "endpoints": ["GET /health", "POST /search", "POST /context"],
-                },
-            )
+            body = _state_ok()
+            body["endpoints"] = ["GET /health", "POST /search", "POST /context"]
+            self._send(200, body)
             return
         self._send(404, {"ok": False, "error": "not found"})
 
@@ -271,6 +265,58 @@ class Handler(BaseHTTPRequestHandler):
             self._send(500, {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)})
 
 
+# ── 端口发现：握手文件 ──────────────────────────────────────────────────
+#
+# 问题：桥监听哪个端口在 config.yaml，插件去哪个端口找在 cordis.patch.yml ——
+# 两处必须人肉对齐，不一致的症状只是「连不上」，和「MCP 没起」「端口被占」
+# 「桥线程死了」长得完全一样。
+#
+# 解法：桥启动时把**事实**写到固定路径，插件读它而不是猜。
+# 文件里同时写失败原因，所以「为什么连不上」也能被读到，不必翻日志。
+#
+# 位置：XDG 风格 ~/.melquiades/bridge.json —— 用固定名而非配置项，
+# 因为「发现某个东西」本身不该需要先配置一遍才知道去哪找。
+
+def discovery_path() -> Path:
+    return Path.home() / ".melquiades" / "bridge.json"
+
+
+def write_discovery(payload: dict[str, Any]) -> None:
+    """写握手文件。**失败只告警**——发现机制挂了不该拖垮桥本身。"""
+    path = discovery_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = dict(payload)
+        payload["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("写发现文件失败（%s）—— 插件将回退到它自己的 endpoint 配置", exc)
+
+
+def clear_discovery() -> None:
+    """桥停了就把文件删掉——留着一个「曾经在 9010」的陈述，比没有更误导。"""
+    try:
+        discovery_path().unlink(missing_ok=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("删发现文件失败（忽略）: %s", exc)
+
+
+def _state_ok() -> dict[str, Any]:
+    st = _STATE
+    return {
+        "ok": bool(st),
+        "db": st.get("db_label"),
+        "port": st.get("port"),
+        "host": st.get("host"),
+        "pid": os.getpid(),
+        "started_at": st.get("started_at"),
+        "uptime_s": round(time.monotonic() - st["started_mono"], 1) if st.get("started_mono") else None,
+        "requests": st.get("requests", 0),
+        "sources": sorted(SOURCE_SPECS),
+        "modes": list(DEFAULT_MODES),
+    }
+
+
 # ── 进程内模式：与 MCP 同生共死 ──────────────────────────────────────────
 
 
@@ -287,8 +333,22 @@ def start_in_thread(cfg: Config, host: str = "127.0.0.1", port: int = DEFAULT_PO
       · `stop_bridge()` 是**优雅**路径：先 `shutdown()` 停 accept，再 `server_close()`
       · 端口被占用（EADDRINUSE）会**原样抛出 OSError**，由调用方决定是否致命——
         在 server.py 里它是「告警并继续」，因为 MCP 才是本命
+
+    关于保活：**不做自动重启**。`serve_forever()` 是稳定循环，不会自己退出；
+    唯一会死的是「启动时端口被占」，而那重试也无用——占用者可能是用户手动跑的
+    另一份 standalone 桥，反复重试只会变成两家抢端口。取而代之的是把状态
+    **如实写进发现文件**，让插件能把「为什么连不上」显示出来。
     """
     _build_state(cfg)          # 不传 reuse_db ⇒ 自建连接
+    _STATE.update(
+        {
+            "host": host,
+            "port": port,
+            "started_mono": time.monotonic(),
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "requests": 0,
+        }
+    )
     httpd = HTTPServer((host, port), Handler)
     t = threading.Thread(
         target=httpd.serve_forever,
@@ -296,6 +356,18 @@ def start_in_thread(cfg: Config, host: str = "127.0.0.1", port: int = DEFAULT_PO
         daemon=True,
     )
     t.start()
+    write_discovery(
+        {
+            "ok": True,
+            "host": host,
+            "port": port,
+            "base": "http://%s:%d" % (host, port),
+            "pid": os.getpid(),
+            "mode": "in-process",
+            "db": _STATE.get("db_label"),
+            "started_at": _STATE.get("started_at"),
+        }
+    )
     logger.info("omnibus bridge on http://%s:%d（daemon 线程，随 MCP 退出）", host, port)
     return httpd
 
@@ -312,6 +384,7 @@ def stop_bridge(httpd: "HTTPServer | None", timeout: float = 3.0) -> None:
         httpd.server_close()
     except Exception as exc:      # noqa: BLE001
         logger.warning("bridge server_close 出错（忽略）: %s", exc)
+    clear_discovery()
     logger.info("omnibus bridge stopped")
 
 

@@ -19,23 +19,61 @@ DSH Web 插件：在侧边栏里搜 **melquiades 账本**（草稿纸 / 会话�
 | **fulltext** | 单语言精确 | 查 `口径` 命中 263 条，不误伤同义词 |
 | **like** | 字面兜底 | 全文分词打不中的短词/生僻串 |
 
-## 前置：起桥
+## 前置：桥
 
-插件本身**不含检索逻辑**——它转发给 `melquiades-http`（只读、仅绑回环）。
+插件本身**不含检索逻辑**——它转发给 melquiades 的 HTTP 桥（只读、仅绑回环）。
+
+### 正常情况下：什么都不用做
+
+桥**随 MCP 一起起**（MCP 进程内的 daemon 线程），MCP 死桥就没了。
+装了 melquiades 这个 MCP、且 `config.yaml` 里 `[bridge] enabled: true`（默认），
+桥就在——不需要额外起进程，也不需要看护。
+
+### 万一：手动起一份（调试用）
 
 ```sh
-# 在 melquiades 仓库里
 melquiades-http --port 9010
-# 或不经安装直接跑
+# 或不经安装
 PYTHONPATH=/path/to/melquiades python -m melquiades.omnibus_http --port 9010
 ```
 
-验证：
+> ⚠️ 两种模式**不要同时开**——会抢端口，后起的那个只告警不启动。
 
-```sh
-curl -s http://127.0.0.1:9010/health
-# {"ok":true,"db":"127.0.0.1:9002/melquiades_medicamento","sources":[...],"modes":[...]}
+### 端口怎么对上：发现文件
+
+**这是本插件唯一不需要人肉对齐的地方。**
+
+桥启动时把事实写到 `~/.melquiades/bridge.json`：
+
+```json
+{"ok": true, "base": "http://127.0.0.1:9010", "port": 9010,
+ "pid": 12345, "mode": "in-process", "db": "127.0.0.1:9002/melquiades_medicamento",
+ "started_at": "2026-10-25T14:29:08+0800"}
 ```
+
+插件每次请求前读它，**配置里写错端口也不会连错**：
+
+| 发现文件状态 | 插件行为 |
+|---|---|
+| 有，`ok:true` | 用它的 `base`（**端口以桥为准**，`endpoint` 配置被忽略） |
+| 有，`ok:false` | 桥尝试过但失败了 → 把 `error` 原文显示给用户 |
+| 没有 | 回退到 `endpoint` 配置，报错里说「MCP 可能没起」 |
+
+桥正常退出时会**删掉**这个文件——留一句「曾经在 9010」比没有更误导。
+
+### 保活：不做自动重启（刻意的）
+
+`serve_forever()` 是稳定循环，不会自己退出；唯一会死的是「启动时端口被占」，
+而那重试也无用——占用者可能是你手动跑的 standalone，反复重试只会变成两家抢端口。
+
+所以不做看护线程，改成**把死法如实写进发现文件**，让插件能说清「为什么连不上」：
+
+| 报错文本 | 真实死因 |
+|---|---|
+| `桥启动失败：端口 … 被占用` | 有另一份桥占了端口 |
+| `桥启动失败：config.yaml 的 [bridge] enabled=false` | 你自己关掉的 |
+| `发现文件说桥在 X，但连不上` | 桥线程已退出（重启 DSH） |
+| `连不上…也没找到 bridge.json` | MCP 没起，或它没读这份 config |
 
 > **为什么不在插件里直连 MariaDB**：检索逻辑（三路候选 + RRF 融合 + 归一化）
 > 只有一份，在 `omnibus.py`。让 JS 再实现一遍必然漂移——本仓真实吃过这个亏

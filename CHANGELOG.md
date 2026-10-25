@@ -5,6 +5,59 @@
 
 ---
 
+## 2026-10-25 — 桥的端口发现与失败可诊断（补 0.2.1 的 webRuntime 陷阱）
+
+### 动机
+
+桥接进 DSH 后暴露两个问题，都是「配置要人肉对齐」造成的：
+
+1. **端口写两处**：桥监听哪个端口在 `config.yaml` 的 `[bridge] port`，插件去哪个
+   端口找在 `cordis.patch.yml` 的 `endpoint`。不一致的症状只是「连不上」。
+2. **「连不上」吞掉了所有死法**：MCP 没起 / 端口被占 / 桥线程退 / 配置关掉，
+   在插件侧完全同形。
+
+顺带记一个**装不上的坑**（不属于桥本身，但同批踩的）：
+DSH `0.2.1-alpha.2` 起 `webRuntime` 服务被移除、改 `webStartup`。官方原文：
+「A profile that injects `webRuntime` now **waits for a service that never mounts**」。
+插件的 `apply()` 因此从未执行、路由从未注册，表现为侧栏 `HTTP 405`——而 405 来自
+静态 dist 兜底，不是插件代码。**症状指向请求处理，真凶在注册环节。**
+
+### 变更
+
+**发现文件 `~/.melquiades/bridge.json`**
+
+桥启动时写、退出时删。插件每次请求前读它（端口**以桥为准**，`endpoint` 只是兜底）：
+
+| 发现文件 | 插件行为 |
+|---|---|
+| `ok:true` | 用它写的 `base` |
+| `ok:false` | 桥尝试过但失败 → 把 `error` 原文给用户 |
+| 不存在 | 回退 `endpoint`，报错指向「MCP 可能没起」 |
+
+失败路径也写文件（`_write_bridge_failure`），所以「为什么没起」不需要翻日志。
+
+**`/health` 补运行态**：`uptime_s` / `pid` / `requests` / `started_at`。
+
+**保活：明确不做。** `serve_forever()` 不会自己退出；唯一会死的是端口被占，
+而那重试只会与手动跑的 standalone 抢端口。改为把死法如实暴露。
+
+**插件侧 `inject` 修正**：`webRuntime` → `webStartup`；`dsh.client.inject` 与
+`peerDependencies` 删掉从未 import 的包（声明不存在的模块只会多一个失败面）。
+
+### 一个自己造又被自己抓到的静默错误
+
+`readDiscovery()` 最初写成 `require('node:fs')` —— host 是 **ESM**，`require` 不存在，
+异常被本函数的 `catch` 吞掉 → 永远返回 `null` → **发现机制看似实现、实际从不生效**。
+所有测试「通过」，只是那条分支永远走不到。教训与「以静默降级为耻」同源：
+`catch { return null }` 这种兜底，必须在注释里写清「什么情况下允许它发生」。
+
+### 验证
+
+发现机制 8/8（桥写文件 / health 新字段 / 插件忽略过时 endpoint / 三种死法可分辨 /
+退出时清理）；插件静态 17/17、转发 e2e 9/9。
+
+---
+
 ## 2026-10-25 — HTTP 桥：把统一检索接进 DSH Web UI
 
 ### 动机

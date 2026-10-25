@@ -21,6 +21,10 @@
  * ③ better-sidebar 缺失 → client 侧不注册 tab（host 路由仍在，可直接 curl 用）
  */
 
+import fs from 'node:fs'
+import os from 'node:os'
+import nodePath from 'node:path'
+
 const DEFAULT_ENDPOINT = 'http://127.0.0.1:9010'
 const DEFAULT_TIMEOUT_MS = 15000
 const DEFAULT_LIMIT = 5
@@ -150,12 +154,73 @@ function normalizeConfig(raw) {
   }
 }
 
+/**
+ * 读桥的发现文件 `~/.melquiades/bridge.json`（桥启动时自己写的）。
+ *
+ * 为什么要有这个：桥监听哪个端口写在 `config.yaml` 的 `[bridge] port`，而插件去
+ * 哪个端口找写在 `cordis.patch.yml` 的 `endpoint` —— 两处**人肉对齐**，不一致的
+ * 症状只是「连不上」，和「MCP 没起」「端口被占」长得一模一样。桥把这个事实写进
+ * 固定路径，插件读它而不是猜。
+ *
+ * 三态（别把「不知道」渲染成「没有」）：
+ *   · 读到 ok:true  → 用它的 base（端口以桥为准）
+ *   · 读到 ok:false → 桥**尝试过但失败了**，把 error 原样带出来
+ *   · 读不到        → 桥可能从没起过；回退到 config.endpoint 继续试
+ */
+function readDiscovery() {
+  try {
+    // ★ 这里曾经写成 require('node:fs')——host 是 ESM，require 不存在，
+    //   异常被本函数的 catch 吞掉 → 永远返回 null → 「发现机制看似实现了但从不生效」。
+    //   静默降级比崩溃难查得多：所有测试都「通过」，只是分支永远走不到。
+    const file = nodePath.join(os.homedir(), '.melquiades', 'bridge.json')
+    const raw = fs.readFileSync(file, 'utf8')
+    const data = JSON.parse(raw)
+    if (!data || typeof data !== 'object') return null
+    return data
+  } catch {
+    return null
+  }
+}
+
+/**
+ * 解析出实际要用的桥地址。
+ * config.endpoint 是**兜底**，不是权威 —— 权威是桥自己写的发现文件。
+ */
+function resolveEndpoint(cfg) {
+  const disc = readDiscovery()
+  if (disc && disc.ok && typeof disc.base === 'string' && disc.base.length > 0) {
+    return { endpoint: disc.base, discovery: disc }
+  }
+  if (disc && disc.ok === false) {
+    return { endpoint: cfg.endpoint, discovery: disc, discoveryError: String(disc.error || '未知') }
+  }
+  return { endpoint: cfg.endpoint, discovery: null }
+}
+
+/** 把「连不上」拆成几种可分辨的死法，而不是笼统报错。 */
+function diagnose(cfg, next, err) {
+  const disc = next.discovery
+  if (disc && disc.ok === false) {
+    return `桥启动失败：${disc.error}（pid=${disc.pid ?? '?'} 于 ${disc.updated_at ?? '?'}）——MCP 日志里搜「http bridge」`
+  }
+  if (disc && disc.ok) {
+    return `发现文件说桥在 ${disc.base}，但连不上（${err}）——桥线程可能已退出，重启 DSH`
+  }
+  return (
+    `连不上搜索桥 ${cfg.endpoint}，也没找到 ~/.melquiades/bridge.json ——` +
+    '大概率 MCP 没跑起来（桥随 MCP 起），或 config.yaml 里 [bridge] enabled=false'
+  )
+}
+
 /** 把浏览器的请求转发给桥；桥的 JSON 原样透传（错误也是）。 */
 async function forward(cfg, path, payload) {
+  // 每次请求前重解析：MCP 可能比 DSH 后启动，缓存住旧地址会一直失败
+  const next = resolveEndpoint(cfg)
+  const base = next.endpoint
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), cfg.timeoutMs)
   try {
-    const resp = await fetch(`${cfg.endpoint}${path}`, {
+    const resp = await fetch(`${base}${path}`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),
@@ -169,12 +234,12 @@ async function forward(cfg, path, payload) {
       // 桥返回了非 JSON：原样报出来，不要伪装成「没有结果」
       return { code: 502, body: { ok: false, error: `桥返回非 JSON（HTTP ${resp.status}）: ${text.slice(0, 300)}` } }
     }
-    return { code: resp.status, body: data }
+    return { code: resp.status, body: { ...data, _bridge: base } }
   } catch (err) {
     if (err && err.name === 'AbortError') {
       return {
         code: 504,
-        body: { ok: false, error: `搜索桥超时（${cfg.timeoutMs}ms）—— 桥在 ${cfg.endpoint} 上吗？` },
+        body: { ok: false, error: `搜索桥超时（${cfg.timeoutMs}ms @ ${base}）`, bridge: base },
       }
     }
     const msg = err instanceof Error ? err.message : String(err)
@@ -182,8 +247,9 @@ async function forward(cfg, path, payload) {
       code: 502,
       body: {
         ok: false,
-        error: `连不上搜索桥 ${cfg.endpoint}: ${msg}`,
-        hint: '先起桥：melquiades-http --port 9010（见 README）',
+        error: diagnose(cfg, next, msg),
+        bridge: base,
+        discovery: next.discovery,
       },
     }
   } finally {
@@ -215,17 +281,20 @@ export function apply(ctx, rawConfig) {
 
     try {
       if (method === 'health' && req.method === 'GET') {
+        const next = resolveEndpoint(cfg)
         const controller = new AbortController()
         const timer = setTimeout(() => controller.abort(), 3000)
         try {
-          const resp = await fetch(`${cfg.endpoint}/health`, { signal: controller.signal })
+          const resp = await fetch(`${next.endpoint}/health`, { signal: controller.signal })
           const data = await resp.json().catch(() => ({ ok: false }))
-          sendJson(res, resp.status, { ...data, bridge: cfg.endpoint })
+          sendJson(res, resp.status, { ...data, bridge: next.endpoint, discovery: next.discovery })
         } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
           sendJson(res, 503, {
             ok: false,
-            error: `桥不可达: ${err instanceof Error ? err.message : String(err)}`,
-            bridge: cfg.endpoint,
+            error: diagnose(cfg, next, msg),
+            bridge: next.endpoint,
+            discovery: next.discovery,
           })
         } finally {
           clearTimeout(timer)

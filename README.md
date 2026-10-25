@@ -179,7 +179,11 @@ POST /context  → {ok, text}
 - **只读**：没有任何写入端点；只绑回环并校验 Host（防 DNS rebinding）
 - 关掉：`config.yaml` 里 `bridge: { enabled: false }`
 
-配套的 DSH 侧插件在 `dsh-omnibus-search`（侧边栏「统一检索」tab）。
+**端口怎么对上**：桥启动时把事实写到 `~/.melquiades/bridge.json`（退出时删），
+DSH 侧插件读它而不是猜——配置里写错端口也不会连错。失败原因也写在同一文件里，
+所以「为什么连不上」不需要翻日志。
+
+配套的 DSH 侧插件在 `plugins/dsh-omnibus-search`（侧边栏「统一检索」tab）。
 
 > 也可以脱离 MCP 单独跑（调试用）：`melquiades-http --port 9010`。
 > 但两种模式**不要同时开**——会抢端口，后起的那个只告警不启动。
