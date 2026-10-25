@@ -397,7 +397,7 @@ draftpad:
   scan_default_limit: ...
 
 dsh:
-  home: <harness-dir>/dsh-domus   # 显式，不猜
+  home: /home/<user>/deepseek-harness/dsh-domus   # 显式，不猜
   sessions_dir: sessions
   scan_interval_sec: 60
   first_scan_budget_files: 10   # 首扫限速

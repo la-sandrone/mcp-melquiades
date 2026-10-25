@@ -233,7 +233,7 @@ LIKE 转义 5/5（`50%` 不误命中 `50 percent`、`a_b` 不误伤 `axb`、`O'N
 ## 四、用法
 
 ```bash
-cd <project-root>
+cd /path/to/melquiades
 export PYTHONPATH=.
 
 # 建表 + 向量列（幂等）

@@ -1,0 +1,119 @@
+# CHANGELOG
+
+格式：按日期倒序。每条记「**为什么**」而不只是「改了什么」——因为半年后回来看，
+动机比 diff 更难重建。
+
+---
+
+## 2026-10-25 — CJK 检索改 bigram、新增跨源检索、多语言修正
+
+### 动机
+
+1. **jieba 分词会漏**：词典覆盖头部，自造词/专业术语切错边界（`布恩迪亚计算机`、
+   `火用`），实测约 30% 漏搜。资料库里全是这类词。
+2. **`innodb_ft_min_token_size` 默认 3 会丢掉所有 1–2 字中文词**：`口径`、`修正`
+   这类词进不了索引，FULLTEXT 返回 0 而 LIKE 能中。
+3. 需要一个「在草稿纸 + 会话正文 + 压缩摘要里一次找齐」的入口。
+
+### 变更
+
+**CJK 检索：jieba → unigram + bigram**（依据 Lucene `CJKBigramFilter(outputUnigrams=true)`）
+
+- `melquiades/tokenizer.py`：新增 `tokenize_cjk_ub()` / `build_cjk_boolean()`。
+  旧的 `tokenize()`（jieba）保留给 legacy 路径。
+- `melquiades/db.py`：`content_tokenized` 由 `TEXT` 改 `MEDIUMTEXT`
+  （bigram 会把文本膨胀 2–3 倍，最大 content 22,116 字符撑爆 65535）。
+- `melquiades/harvest/message_runner.py`：写入时计算 `body_tokenized`。
+- `melquiades/retrieval.py`：全文路改走 bigram 布尔串。
+- **数据已回填**：`draftpad` 1,802 行 / `dsh_message` 14 万行 / `dsh_compaction` 181 行，
+  与 LIKE 逐条对拍一致。
+
+**非 CJK 分支扩到全 Unicode 字母**（关键修正）
+
+```python
+# 旧：只认 ASCII，西里尔/希腊/带变音拉丁整段丢弃
+_CJK_CHUNK_RE = re.compile(f"[{_CJK_HAN}]+|[A-Za-z0-9_]+")
+# 新：两段 alternation，顺序即优先级
+_CJK_CHUNK_RE = re.compile(f"([{_CJK_HAN}]+)|(\\w+)", re.UNICODE)
+```
+
+**新增 `omnibus.py` + `search_OMNIA`**
+
+跨 `draftpad` / `dsh_message` / `dsh_compaction` 三源，各源按规定能力跑
+向量 / FULLTEXT / LIKE 三路，归一化融合。
+
+**取数口径（用户拍板，别改回「宽取后窄截」）**：`limit` 是**每一路各取多少条**，
+三路各取 limit → 按 (source, id) 去重 → **剩多少给多少，不截断回 limit**。
+理由：宽取后窄截会挤掉「只有某一路命中、分数偏低」的独特结果，而那类最不该漏。
+
+**新增 `message_context(guid, before, after)`**
+
+`search_OMNIA` 只能给片段，看清前后文要靠它。按 `line_no` 排序取**相邻 N 条记录**
+（不能按 `line_no ± N` 取窗口——line_no 是事件物理行号，抄录器跳过 chunk 家族后是稀疏的）。
+
+**修复：会话正文命中不显示 guid**
+
+`search_OMNIA` 的 messages 源原来只显示 `session_id`，但 `message_context` 要的是
+`guid` —— 等于给了结果却接不上下一步。已改为显示完整 64 位 guid。
+
+### 数据库调优（与 memoria 同一实例）
+
+- `innodb_ft_min_token_size` 3 → **1**（`my.ini`，需重启；`SET GLOBAL` 会静默无效）
+- `innodb_ft_sort_pll_degree` 2 → **8**、`innodb_ft_cache_size` 64M → **512M**
+- `dsh_message.body_sha256` **加索引**（原本没有 → 每条 UPDATE 全表扫 14 万行，
+  385 ms；一批 32 条 = 11.7 秒，占任务 73% 时间。补索引后 **188 倍**提速）
+
+### 文档
+
+`README.md` 加了三段警告：① Zipf 长尾 + Unicode 边缘情况 ② 数据量已到中小型网站
+级别、请严肃对待性能与 MariaDB/MySQL 差异 ③ 向量检索是近似的（ANN）。
+
+工具描述（`draftpad_find` / `archive_find` / `search_OMNIA`）补了 ANN 与多语言边界
+——**下游 LLM 消费者必须知情**。
+
+
+### ⚠️ 大坑：带 FULLTEXT 的表，改列注释也要重建整表
+
+**症状**：想改 `content_tokenized` 的列注释（`jieba` → `bigram`），
+`ALTER TABLE ... MODIFY COLUMN ... COMMENT '...'` 卡住/重建十几 GB。
+
+**实测对比**：
+
+| 表 | `ALGORITHM` | 结果 |
+|---|---|---|
+| **无 FULLTEXT**（试探用） | `INSTANT` | ✅ 成功，**25.9 ms** |
+| **有 FULLTEXT**（真实表） | `INSTANT` | ❌ `ERROR 1846` |
+| 同上 | `NOCOPY` | ❌ `ERROR 1846` |
+| 同上 | `COPY` | ✅ 但**重建整表 + 重建 FTS**（17 GB → 1–1.5 小时） |
+
+**错误信息里的 Reason 才是关键**：
+
+```
+ALGORITHM=INSTANT is not supported.
+Reason: InnoDB presently supports one FULLTEXT index creation at a time.
+Try ALGORITHM=COPY
+```
+
+**不是「改注释要重建」，而是「表上有 FULLTEXT 时 InnoDB 的 ALTER 实现不支持
+非 COPY 算法」**——跟注释内容、跟列类型都无关。这是 MariaDB 的实现限制。
+
+**结论 / 纪律**：
+
+- ❌ **不要为了改一个注释单独跑 `MODIFY COLUMN`**
+- ✅ **攒着**：下次真要动这张表时（改列类型、加索引、分词口径再变），
+  把 `MODIFY COLUMN ... COMMENT` 一起写进**同一条 ALTER**，一次 COPY 全解决
+- ⚠️ 也别想着「先删 FULLTEXT 再改」——删 FULLTEXT 本身也要 rebuild（实测 91 分钟），
+  两头都亏
+
+**当前状态**：`documents_book_chunk.content_tokenized`（memoria 库） 的注释仍是旧文案
+（`应用层 jieba 分词结果`），**有意不修**，等下次重建时合并处理。
+（`draftpad` 的同名列注释已是新文案——那张表小，之前顺手改过。）
+
+### 已知边界（写清不修）
+
+| 问题 | 现状 |
+|---|---|
+| 向量路是 HNSW 近似 | top-1 实测 92%、top-10 100%；**不可用于精确查找/判重** |
+| 俄希拉丁在 `content_tokenized` 里为空 | **不影响查询**——非 CJK 走 `content` 列，不碰 tokenized |
+| 希腊文/拉丁文屈折变化（`Πλάτων` vs `Πλάτωνος`） | 需词形还原，属独立工程，**以后再说** |
+| `content_tokenized` 列注释仍写「jieba」 | 改列注释要 `MODIFY COLUMN`，不急 |

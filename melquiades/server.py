@@ -41,6 +41,12 @@ from melquiades.retrieval import (
 from melquiades.schema import ensure_all_vectors
 from melquiades.sqlguard import COLS_COMPACTION, COLS_DRAFTPAD, SqlGuardError
 from melquiades.tokenizer import tokenize
+from melquiades.omnibus import (
+    DEFAULT_MODES as OMNIA_DEFAULT_MODES,
+    DEFAULT_SOURCES as OMNIA_DEFAULT_SOURCES,
+    OmnibusSearcher,
+    format_hits as omnia_format,
+)
 from melquiades.harvest.runner import HarvestRunner
 from melquiades.harvest.scheduler import HarvestScheduler, spawn_fire_and_forget
 from melquiades.harvest.store import HarvestStore
@@ -480,6 +486,16 @@ def draftpad_amend(ids: Any, text: str) -> str:
         "          传 false 可**本次关掉**——精排逐条打分、取的是「最像」而不是\n"
         "          「最相关」，做**穷举/枚举型**查询时精确排序反而碍事，此时关掉。\n"
         "          ★ 对 mode=keyword / mode=condition / auto 的 LIKE 兜底分支**不生效**。\n\n"
+        "**⚠️ 向量路是近似检索（ANN/HNSW）**：62.5 万点实测 top-1 命中率约 92%、\n"
+        "top-10 约 100%。**可用于语义召回，不要用来做精确查找/判重/「找这一条」**——\n"
+        "那会撞上漏检。精确匹配请用 fulltext / keyword / condition 模式。\n\n"
+        "**关于俄文/希腊文/带变音拉丁文**：**非 CJK 查询走 `content` 列的 FULLTEXT\n"
+        "（MariaDB 默认空格分词），不依赖 tokenized，正常工作**（实测俄文可命中）。\n"
+        "`content_tokenized` 里的俄希拉丁为空，只影响「中文查询命中俄希拉丁内容」\n"
+        "这类混合场景——而那类场景本来就该走**向量路**（多语言共享语义空间，实测\n"
+        "中文查询直接命中俄文书的对应章节）。\n"
+        "**残留问题**：希腊文/拉丁文的屈折变化（`Πλάτων` vs `Πλάτωνος`）会让精确词\n"
+        "匹配失败，需要词形还原（lemmatization）——那是另一件工程，与 tokenized 无关。\n\n"
         "返回: 命中列表 + **检索口径说明**（用了哪条路、是否降级、是否重排）。"
     )
 )
@@ -589,6 +605,16 @@ def _archive_find_impl(query: str, mode: str, limit: int, condition: str,
         "      session: 只看某个会话的压缩档案。传裸 uuid 或 session-<uuid>"
         " 均可（前缀自动剥）；\"current\" 需进程环境有 $DSH_SESSION_ID"
         "——MCP 常驻进程通常没有，请先 bash `echo $DSH_SESSION_ID` 再原样传入。\n"
+        "**⚠️ 向量路是近似检索（ANN/HNSW）**：62.5 万点实测 top-1 命中率约 92%、\n"
+        "top-10 约 100%。**可用于语义召回，不要用来做精确查找/判重/「找这一条」**——\n"
+        "那会撞上漏检。精确匹配请用 fulltext / keyword / condition 模式。\n\n"
+        "**关于俄文/希腊文/带变音拉丁文**：**非 CJK 查询走 `content` 列的 FULLTEXT\n"
+        "（MariaDB 默认空格分词），不依赖 tokenized，正常工作**（实测俄文可命中）。\n"
+        "`content_tokenized` 里的俄希拉丁为空，只影响「中文查询命中俄希拉丁内容」\n"
+        "这类混合场景——而那类场景本来就该走**向量路**（多语言共享语义空间，实测\n"
+        "中文查询直接命中俄文书的对应章节）。\n"
+        "**残留问题**：希腊文/拉丁文的屈折变化（`Πλάτων` vs `Πλάτωνος`）会让精确词\n"
+        "匹配失败，需要词形还原（lemmatization）——那是另一件工程，与 tokenized 无关。\n\n"
         "**注意**: 摘要是**有损**的（压缩比约 35:1）；命中后用 archive_expand 取指针回查原文。"
     )
 )
@@ -630,6 +656,147 @@ def archive_find(query: str = "", mode: str = MODE_AUTO, limit: int = 0,
         return f"REJECTED: {exc}"
     except Exception as exc:
         return f"ERROR: {type(exc).__name__}: {exc}"
+
+
+# ──────────────────────────────────────────────
+# 跨源统一检索（search_OMNIA）
+# ──────────────────────────────────────────────
+
+@mcp.tool(
+    description=(
+        "跨源统一检索：一次调用同时搜【草稿纸 + 会话正文 + 压缩摘要】，"
+        "每个源按其能力走 向量 + FULLTEXT + LIKE，归一化后融合排序。\n\n"
+        "用途: 找『以前在哪儿写过/聊过 X』，而不确定它落在草稿纸、会话记录、\n"
+        "      还是已被压缩掉的上文里。写长篇小说/设定集时尤其常用。\n"
+        "**不替代** draftpad_find / archive_find —— 精细模式（vector / fulltext /\n"
+        "clue / keyword / condition / rerank / expand）仍然在那两个工具里，\n"
+        "本工具只负责『先找到大概在哪』。\n\n"
+        "参数:\n"
+        "  query:            查询串。CJK 走 unigram+bigram（单字/任意子串可搜）。\n"
+        "  limit:            **每一路各取多少条**（默认 5，上限 50）。\n"
+        "                    ★ 这不是最终返回条数：三路各取 limit 条 → 去重 →\n"
+        "                      剩多少给多少，不截断回 limit（确保不漏）。\n"
+        "                      所以传 5 常常会拿回 15–25 条，这是有意的。\n"
+        "  sources:          限定源，逗号分隔：draftpad / messages / compactions；缺省全搜。\n"
+        "  modes:            限定路，逗号分隔：vector / fulltext / like；缺省三路全开。\n"
+        "                    关掉 like 能省时间——会话正文的 LIKE 是 14 万行全表扫（约 1–3 秒）。\n"
+        "  per_source_limit: 覆盖每路取数（一般不用传，默认跟随 limit）。\n\n"
+        "能力边界（必须知道，否则会误判『库里没有』）:\n"
+        "  · 会话正文（dsh_message）**没有向量列**，该源只走全文+LIKE；\n"
+        "    语义（模糊）召回由草稿纸与压缩摘要承担。\n"
+        "  · 压缩摘要是**有损**的（约 35:1）；命中后必须 archive_expand → archive_fetch\n"
+        "    回查原文，不要只读摘要作答。\n"
+        "  · **俄文 / 希腊文 / 带变音拉丁文**：非 CJK 查询走 `content` 列的 FULLTEXT\n"
+        "    （默认空格分词）**不依赖 tokenized，正常工作**；`content_tokenized` 里\n"
+        "    这些文字为空，只影响「中文查询命中它们」的混合场景——那该走向量路。\n"
+        "    残留问题：希腊/拉丁文的屈折变化（`Πλάτων` vs `Πλάτωνος`）使精确词匹配\n"
+        "    失败，需词形还原，属另一件工程。\n"
+        "  · **向量路是 HNSW 近似检索**（62.5 万点实测 top-1 命中率 ~92%、top-10 ~100%）。\n"
+        "    适合语义召回；**不要用它判重/找「就是这一条」**，那会漏。精确查找走 fulltext/like。\n"
+        "  · 会话正文命中后，用 message_context(guid, before, after) 取该行前后的上下文。\n\n"
+        "返回: 统一命中列表（源 / 分数 / 命中路 / 片段）+ 检索口径 + 回溯指引。"
+    )
+)
+def search_OMNIA(query: str = "", limit: int = 5, sources: str = "",
+                 modes: str = "", per_source_limit: int = 0) -> str:
+    assert _retriever is not None
+    srcs = [s.strip() for s in (sources or "").split(",") if s.strip()]
+    mds = [m.strip() for m in (modes or "").split(",") if m.strip()]
+    n = max(1, min(int(limit or 5), 50))
+    ps = max(0, min(int(per_source_limit or 0), 200))
+    try:
+        searcher = OmnibusSearcher(_retriever)
+        res = searcher.search(
+            query, limit=n,
+            sources=srcs or list(OMNIA_DEFAULT_SOURCES),
+            modes=mds or list(OMNIA_DEFAULT_MODES),
+            per_source_limit=ps,
+        )
+        return omnia_format(res)
+    except Exception as exc:  # noqa: BLE001
+        return f"ERROR: {type(exc).__name__}: {exc}"
+
+
+@mcp.tool(
+    description=(
+        "按 guid 取一条会话正文，并展开它前后的上下文（同一会话、同一代日志）。\n\n"
+        "用途: search_OMNIA 或 draftpad_find 命中「会话正文」后，\n"
+        "      看那一段到底前后说了什么——否则只有片段容易误读。\n\n"
+        "参数:\n"
+        "  guid:     dsh_message.guid（search_OMNIA 的命中里带；64 位十六进制）。\n"
+        "  before:   往前取多少条（默认 3，上限 30）。\n"
+        "  after:    往后取多少条（默认 3，上限 30）。\n"
+        "  max_chars: 每条正文截断字符数（默认 1200，上限 8000）。\n\n"
+        "说明:\n"
+        "  · 按 line_no（解压后物理行号）取相邻，同会话同 source_gens 内。\n"
+        "  · 目标行以 ▶ 标记；正文里的换行压成空格以便阅读。\n"
+        "  · 这是**只读快照**：DSH 仍在追加的会话，最新几条可能还没抄进来\n"
+        "    （抄录器 60 秒一轮，本场会话通常延迟 <1 分钟）。"
+    )
+)
+def message_context(guid: str = "", before: int = 3, after: int = 3,
+                    max_chars: int = 1200) -> str:
+    assert _db is not None
+    guid = (guid or "").strip()
+    if not guid:
+        return "需要 guid（search_OMNIA 的「会话正文」命中里带）"
+    try:
+        head = _db.query_one(
+            "SELECT session_id, source_gens, line_no, ev_type, kind, role, ev_time "
+            "FROM dsh_message WHERE guid = ?",
+            (guid,),
+            readonly=True,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return f"ERROR: {type(exc).__name__}: {exc}"
+    if not head:
+        return f"未找到 guid={guid} 的行（可能尚未抄录，或 guid 抄错）"
+
+    b = max(0, min(int(before or 0), 30))
+    a = max(0, min(int(after or 0), 30))
+    cap = max(120, min(int(max_chars or 1200), 8000))
+    target = int(head["line_no"])
+    sid, gens = head["session_id"], head["source_gens"]
+    cols = "guid, line_no, ev_type, kind, role, ev_time, body, ordinal"
+
+    # ★ 不能按「line_no ± N」取窗口：line_no 是**事件物理行号**，而抄录器跳过
+    #   chunk 家族（assistant/chunk 等）⇒ 行号是稀疏的，±N 常常取不到任何邻行
+    #   （实测 before=2/after=2 只返回 1 条）。正解是按 line_no 排序取**相邻 N 条**：
+    #   向前取「line_no <= 目标」的最后 b 条，向后取「line_no > 目标」的最前 a 条。
+    try:
+        back = _db.query(
+            f"SELECT {cols} FROM dsh_message "
+            "WHERE session_id = ? AND source_gens = ? AND line_no <= ? "
+            "ORDER BY line_no DESC, ordinal DESC LIMIT ?",
+            (sid, gens, target, b + 1), readonly=True,
+        )
+        fwd = _db.query(
+            f"SELECT {cols} FROM dsh_message "
+            "WHERE session_id = ? AND source_gens = ? AND line_no > ? "
+            "ORDER BY line_no ASC, ordinal ASC LIMIT ?",
+            (sid, gens, target, a), readonly=True,
+        )
+        rows = sorted(back + fwd, key=lambda r: (r["line_no"], r["ordinal"]))
+    except Exception as exc:  # noqa: BLE001
+        return f"ERROR: {type(exc).__name__}: {exc}"
+
+    lines = [
+        f"会话 {head['session_id']} · 目标 L{target} · "
+        f"取回 {len(rows)} 条（前 {len(back) - 1} / 后 {len(fwd)}）",
+        "",
+    ]
+    for r in rows:
+        mark = "▶" if str(r["guid"]) == guid else " "
+        body = " ".join(str(r.get("body") or "").split())
+        if len(body) > cap:
+            body = body[:cap] + f"…（截断，原长 {len(body)} 字）"
+        lines.append(
+            f"{mark} L{r['line_no']} [{r['ev_type']}/{r['kind']}]"
+            f"{(' role=' + r['role']) if r.get('role') else ''}"
+            f" · {r['ev_time']}"
+        )
+        lines.append(f"   {body or '(空正文)'}")
+    return "\n".join(lines)
 
 
 @mcp.tool(

@@ -44,6 +44,22 @@ _CJK_RE = re.compile(
 # 标准空白分隔（英文/ASCII 文本的分词模式）
 _WHITESPACE_RE = re.compile(r"\s+")
 
+# ── CJK 全文检索口径（unigram + bigram）用的「纯汉字」范围 ──────────────
+# 与上面的 _CJK_RE 不同：那里含标点/全角符号（用于"这段文本算不算 CJK"的判断），
+# 这里只取汉字——标点成 token 会污染索引。
+_CJK_HAN = r"\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"
+# ★ 2026-10-25 修正：原来非 CJK 分支只认 `[A-Za-z0-9_]+`，于是**西里尔文（俄）、
+#   希腊文、带变音的拉丁文（é/ü/ñ）整段匹配不到 ⇒ 被直接丢弃，tokenized 列为空。
+#   实测触发场景：memorya 的古典学专著里有 Византийская библиотека（拜占庭文库）、
+#   Православная Энциклопедия（东正教百科）等成批俄文材料。
+#
+#   新规则用两段 alternation（**顺序即优先级**）：
+#     ① `[CJK]+`  → unigram + bigram（不变）
+#     ② `\w+`     → Unicode 模式下匹配所有字母/数字/下划线（俄希拉丁、标识符整体保留）
+#   因为 alternation 从左到右，中文不会落进 `\w+`（CJK 也是 \w，但第①段先命中）。
+_CJK_CHUNK_RE = re.compile(f"([{_CJK_HAN}]+)|(\\w+)", re.UNICODE)
+_CJK_HAN_RE = re.compile(f"[{_CJK_HAN}]")
+
 _jieba_available: bool | None = None
 
 
@@ -230,3 +246,72 @@ def escape_like(term: str) -> str:
         .replace("%", "\\%")
         .replace("_", "\\_")
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# CJK 全文检索口径：unigram + bigram（dsh_message 用，**不走 jieba**）
+# ══════════════════════════════════════════════════════════════════════════
+
+def tokenize_cjk_ub(text: str) -> str:
+    """把文本切成 CJK unigram + bigram 串（写入 FULLTEXT 索引用）。
+
+    规则：
+      · 连续汉字串 → **每个汉字**一个 token + **每对相邻汉字**一个 token
+        "绘图工具" → 绘 图 工 具 绘图 图工 工具
+      · 英文/数字/下划线串 → 原样一个 token
+      · 其余字符（标点等）→ 丢弃
+
+    为什么不用 jieba（本模块的 tokenize()）：
+      依据 Lucene `CJKBigramFilter(outputUnigrams=true)` 与 Elasticsearch 内置
+      `cjk_bigram`；学术侧见 SIGIR'98《Comparing Representations in Chinese
+      Information Retrieval》—— bigram 与词切分效果相当甚至更好，且**不依赖词典**。
+      jieba 会把专名/新词/代码标识符切错，bigram 是机械规则，切不错。
+
+    为什么必须 unigram（而不是只 bigram）：
+      只 bigram 时「绘」搜不到「绘图」——索引里没有 1 字符的 token。
+      加上 unigram 才能支持单字查询。
+
+    ★ 前置条件：MariaDB 侧 `innodb_ft_min_token_size = 1`。
+      取默认值 3 时 1-2 字符 token 在索引阶段被**静默丢弃**，实测
+      「会话」「绘图」「绘」全部 0 命中，而 3 字的「草稿纸」正常。
+      （该变量只能改 my.ini 重启生效；`SET GLOBAL` 会成功返回但不生效。）
+
+    ★ 与 tokenize() 的分工：tokenize() 是 jieba 口径，服务 draftpad 旧索引；
+      本函数是 dsh_message 的口径。**两者不可混用**——混用会让写入侧与查询侧
+      的 token 集合不一致，表现为"明明有却搜不到"。
+    """
+    if not text:
+        return ""
+
+    out: list[str] = []
+    for cjk, other in _CJK_CHUNK_RE.findall(text):
+        chunk = cjk or other
+        if cjk:                                                  # CJK：unigram + bigram
+            out.extend(chunk)
+            out.extend(chunk[i:i + 2] for i in range(len(chunk) - 1))
+        else:
+            out.append(chunk)
+    return " ".join(out)
+
+
+def build_cjk_boolean(query: str) -> str:
+    """把用户查询转成 MATCH...AGAINST 的 BOOLEAN 表达式（写入口径的查询侧镜像）。
+
+    · 单字 CJK → `+字`
+    · 多字 CJK → 全部 bigram 用 AND 串起来（"+绘图 +图工 +工具"）
+    · 英文/数字 → `+原词`
+
+    与 tokenize_cjk_ub 必须保持同一套切分规则，否则查询侧拼出的 token
+    在索引里根本不存在。
+    """
+    terms: list[str] = []
+    for cjk, other in _CJK_CHUNK_RE.findall(query or ""):
+        chunk = cjk or other
+        if cjk:
+            if len(chunk) == 1:
+                terms.append("+" + chunk)
+            else:
+                terms.extend("+" + chunk[i:i + 2] for i in range(len(chunk) - 1))
+        else:
+            terms.append("+" + chunk)
+    return " ".join(terms)

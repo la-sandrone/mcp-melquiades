@@ -27,6 +27,7 @@ import zstandard as zstd
 
 from melquiades.harvest.message_extract import messages_from_events
 from melquiades.harvest.reader import session_id_from_path
+from melquiades.tokenizer import tokenize_cjk_ub
 
 logger = logging.getLogger(__name__)
 
@@ -160,14 +161,16 @@ class MessageStore:
                     """INSERT INTO dsh_message
                        (guid, session_id, source_gens, line_no, block_path, seq, ev_type,
                         kind, role, turn, ev_time, cwd, ordinal, is_shadowed, is_index,
-                        body, body_sha256, body_bytes)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?)
+                        body, body_sha256, body_bytes, body_tokenized)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?)
                        ON DUPLICATE KEY UPDATE body=VALUES(body), ev_time=VALUES(ev_time),
-                         body_sha256=VALUES(body_sha256), body_bytes=VALUES(body_bytes)""",
+                         body_sha256=VALUES(body_sha256), body_bytes=VALUES(body_bytes),
+                         body_tokenized=VALUES(body_tokenized)""",
                     [(r["guid"], session_id, gens, r["line_no"], r["block_path"], r["seq"],
                       r["ev_type"], r["kind"], r["role"], r["turn"], r["ev_time"], cwd,
                       r["ordinal"], 1 if "\u2591" in (r["body"] or "") else 0,
-                      r["body"], r["body_sha256"], r["body_bytes"]) for r in batch],
+                      r["body"], r["body_sha256"], r["body_bytes"],
+                      tokenize_cjk_ub(r["body"] or "")) for r in batch],
                 )
                 n += len(batch)
         return n

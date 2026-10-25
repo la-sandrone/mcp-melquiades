@@ -48,7 +48,9 @@ from melquiades.sqlguard import (
     guard_table,
 )
 from melquiades.tokenizer import (
+    build_cjk_boolean,
     escape_like,
+    has_cjk,
     split_clues,
     split_keywords,
     tokenize_query,
@@ -532,6 +534,28 @@ class Retriever:
         self, query: str, table: str, select_cols: str,
         where_extra: str, params_extra: tuple, limit: int,
     ) -> list[Hit]:
+        # **⚠️ 这是近似检索（ANN），结果不保证精确**
+        #
+        # MariaDB 的 `VECTOR KEY` 是 HNSW —— 近似最近邻，recall 可以低于 100%，
+        # 而且它不会告诉你漏了什么。2026-10-25 在 memoria 的 documents_book_chunk
+        # （62.5 万点）上用自查询实测：
+        #
+        #     自查询 top-1 命中自己： 12/13 = 92%
+        #     自己在 top-10 里：      13/13 = 100%
+        #     （mhnsw_ef_search=20；调到 400 无任何变化，该参数在 12.3.2 上未见效）
+        #
+        # 排除过程：IGNORE INDEX 暴力扫描 → 精确正确；Python 手算余弦 → 0.000000；
+        # EXPLAIN → 确实走 idx_vec_chunk。所以数据与距离函数都对，是索引给了近似答案。
+        #
+        # 两条纪律：
+        #   1. 可以用它做语义召回（top-k 足够，实测 top-10 100%）——本函数正是此用途；
+        #   2. 绝不要用它做精确查找（自查询/判重/找重复/验证是否已入库），那会撞上那 8%。
+        #      精确查找走 FULLTEXT 或 LIKE。
+        #
+        # 表越小 recall 越高（图小、连通性好），但不要假设小表就是 100%。
+        # 另注：VEC_DISTANCE（不带 _COSINE）会报 index is not found；建索引时
+        # DISTANCE=cosine 必须显式写，否则静默降级为 mhnsw_default_distance（euclidean）。
+
         emb = self.embed(query)
         if emb is None:
             return []
@@ -575,26 +599,30 @@ class Retriever:
         """
         FULLTEXT BOOLEAN MODE。
 
-        ★ 实测（2026-09-22）决定列选择 —— 与直觉相反：
-          `innodb_ft_min_token_size = 3` ⇒ **长度 < 3 的 token 不进索引**。
-          · jieba 分词列 `content_tokenized`：把长串切成 2 字词（"口径"/"修正"）
-            ⇒ 全被丢弃 ⇒ `MATCH(...) '+口径*'` = **0 命中**
-          · 原始列 `content`：保留连续 4+ 字串 ⇒ 前缀匹配有效
-            ⇒ `MATCH(content) '+口径*'` = **62 命中**
-          ⇒ 故草稿纸**统一用 `content` 列**。`content_tokenized` 保留但不再
-            用于检索（若将来调整 min_token_size，可再启用）。
-          2 字中文词的限制在 meta.notes 里显式说明（不静默降级）。
-        ★ 表不同列名也不同：dsh_compaction **没有 content 列**，正文是 summary
-          （已建 FULLTEXT 索引 ft_compaction_summary）⇒ 见下方 col 的按表选择。
+        ★ 2026-10-25 口径切换（推翻 2026-09-22 的结论）：
+          当时因为 `innodb_ft_min_token_size = 3` 把 2 字 token 全丢，
+          `MATCH(content_tokenized) '+口径*'` = 0 命中，只好弃用分词列、
+          改走 `content` 原文列（前缀匹配）。**那等于放弃了分词检索能力**：
+          前缀匹配只能命中"某个 token 以该词开头"，词中/词尾出现搜不到。
+
+          现在两件事都变了：
+            ① `innodb_ft_min_token_size = 1`（my.ini，重启生效）；
+            ② `content_tokenized` 改用 unigram+bigram 机械切分（不再 jieba）。
+          ⇒ 分词列**重新启用**，且支持单字与任意子串。
+
+          即便某表的分词列尚未回填（MATCH 命中 0），也**不会静默降级**：
+          本函数之外还有 LIKE 兜底路径（按日期倒序），草稿纸数据量小、付得起。
+
+        ★ 表不同列名也不同：draftpad 与 dsh_compaction 都有 content_tokenized
+          （前者 1802 行、后者 181 行，均 100% 回填）；若将来出现没有该列的
+          表，必须显式加分支——写死列名会让该表全文路必然报 Unknown column，
+          而异常若被吞掉就表现为「全文路无命中」（2026-09-22 实测抓到的静默降级）。
         """
-        bo_query = tokenize_query(query)
+        is_cjk = has_cjk(query)
+        bo_query = build_cjk_boolean(query) if is_cjk else tokenize_query(query)
         if not bo_query:
             return []
-        # ★ 列名必须**按表**选：draftpad 的正文列是 content，dsh_compaction
-        #   **没有 content 列**（它的正文是 summary）。写死 content 会让
-        #   compaction 的全文路必然报 Unknown column，而异常若被吞掉就
-        #   表现为「全文路无命中」—— 2026-09-22 实测抓到的静默降级。
-        col = "content" if table == "draftpad" else "summary"
+        col = "content_tokenized" if table in ("draftpad", "dsh_compaction") else "summary"
 
         sql = (
             f"SELECT {select_cols}, MATCH({col}) AGAINST(? IN BOOLEAN MODE) AS _score "

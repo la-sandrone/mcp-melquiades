@@ -54,14 +54,32 @@ def _has_cjk(text: str) -> bool:
 # DDL 语句 — 建表
 # ──────────────────────────────────────────────
 
+# ⚠️ 修改本文件里任何列定义前必读：
+#
+#   表上带 FULLTEXT 索引时，`ALTER TABLE ... MODIFY COLUMN`（**哪怕只改 COMMENT**）
+#   只能走 `ALGORITHM=COPY` —— 会重建整表 + 重建 FTS 索引。
+#   `INSTANT` / `NOCOPY` 都会被拒，错误是：
+#       ERROR 1846: ALGORITHM=INSTANT is not supported.
+#       Reason: InnoDB presently supports one FULLTEXT index creation at a time.
+#
+#   实测对照：无 FULLTEXT 的表改注释 = INSTANT，**25.9 ms**；
+#             有 FULLTEXT 的 17 GB 表 = 1–1.5 小时。
+#
+#   所以：**改注释不要单独跑 DDL**，攒到下次必须重建（改列类型/加索引）时
+#   合并进同一条 ALTER。也别想"先删 FULLTEXT 再改"——删 FULLTEXT 自己也要
+#   rebuild（实测 91 分钟）。
+#
+#   另注：`draftpad` 的 content_tokenized 注释已是新文案（这张表小，改过）；
+#   但 memoria 库的 `documents_book_chunk` 同名列表**有意未改**，等下次重建。
+#
 DDL_DRAFTPAD = """
 CREATE TABLE IF NOT EXISTS draftpad (
     id                  INT             NOT NULL AUTO_INCREMENT,
     session_id          VARCHAR(36)     NOT NULL,
     note_key            VARCHAR(128)    NOT NULL DEFAULT '',
     content             TEXT            NOT NULL,
-    content_tokenized   TEXT            DEFAULT NULL
-        COMMENT 'jieba 分词结果（空格分隔），用于 CJK FULLTEXT 搜索',
+    content_tokenized   MEDIUMTEXT      DEFAULT NULL
+        COMMENT 'CJK unigram+bigram（2026-10-25 起；原 TEXT 装不下膨胀后的串）',
     tags                VARCHAR(1024)   DEFAULT '[]',
     model_name          VARCHAR(100)    DEFAULT '',
     chunk_index         INT             DEFAULT 0,
@@ -81,8 +99,8 @@ CREATE TABLE IF NOT EXISTS draftpad (
 
 DDL_MIGRATE_TOKENIZED_COLUMN = """
 ALTER TABLE draftpad
-    ADD COLUMN IF NOT EXISTS content_tokenized TEXT DEFAULT NULL
-        COMMENT 'jieba 分词结果（空格分隔），用于 CJK FULLTEXT 搜索'
+    ADD COLUMN IF NOT EXISTS content_tokenized MEDIUMTEXT DEFAULT NULL
+        COMMENT 'CJK unigram+bigram（2026-10-25 起；原 TEXT 装不下膨胀后的串）'
 """
 
 DDL_MIGRATE_TOKENIZED_INDEX = """
@@ -227,22 +245,26 @@ class Database:
         finally:
             conn.close()
 
-    # ── jieba 分词 ──
+    # ── CJK 分词（写入 content_tokenized 列）──
 
     @staticmethod
     def _tokenize_cjk(text: str) -> str:
-        """
-        用 jieba 对文本分词，返回空格分隔的结果。
+        """把文本切成 CJK unigram+bigram 串（写入 content_tokenized）。
 
-        jieba 未安装时返回原始文本（降级）。
-        空字符串返回空字符串。
+        ★ 2026-10-25 口径切换：原实现是 jieba 分词。实测两个致命问题：
+          1. jieba 切出的 2 字词在 `innodb_ft_min_token_size=3` 时代被索引全部
+             丢弃（`+口径*` = 0 命中），当时只能弃用本列、改走 `content` 列，
+             于是**放弃了分词检索能力**；
+          2. 即便把该参数改为 1 并重建索引，仍有约 30% 漏搜——jieba 的切分
+             边界与用户查询的词边界不一致（"会话" 被切成 "会 话"）。
+        改用机械切分（Lucene CJKBigramFilter / ES cjk_bigram 的同一方案）：
+        每个汉字一个 token + 每对相邻汉字一个 token，不依赖词典，任意子串可搜。
+
+        前置条件：MariaDB `innodb_ft_min_token_size = 1`（已配）。
+        查询侧对应 `tokenizer.build_cjk_boolean`，两侧必须同一口径。
         """
-        if not text:
-            return ""
-        if jieba is None:
-            return text
-        tokens = jieba.cut(text)
-        return " ".join(tokens)
+        from melquiades.tokenizer import tokenize_cjk_ub
+        return tokenize_cjk_ub(text or "")
 
     # ── CRUD: 写操作 ──
 

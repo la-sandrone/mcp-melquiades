@@ -180,7 +180,7 @@ class DshConfig:
     #   dsh-domus-<版本去前导 v>    （例 v0.1.7-rc.2 → dsh-domus-0.1.7-rc.2）
     # 理由见 resolve_dsh_home 的 ①b：写死 home 的代价是改名/升级当天静默断流
     # （2026-09-26 实测 files=0/0，只报一句 "sessions 目录不存在"）。
-    harness_dir: Optional[str] = None        # 例 <harness-dir>
+    harness_dir: Optional[str] = None        # 例 /home/<user>/deepseek-harness
     home: Optional[str] = None               # 显式指定则优先（逃生口）；留空 = 派生
     sessions_dir: str = "sessions"
     # ⚠️ 已淘汰（2026-09-26）：日志发现改为【按文件名解析代数、取最大】
