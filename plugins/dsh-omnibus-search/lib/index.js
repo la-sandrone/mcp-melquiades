@@ -28,7 +28,7 @@ const DEFAULT_MODES = 'vector,fulltext,like'
 const MAX_BODY_BYTES = 1 << 20
 
 export const name = 'dsh-omnibus-search'
-export const inject = ['webServer', 'webRuntime']
+export const inject = ['webServer', 'webStartup']
 
 /** 读请求体（带上限，避免被本地大 payload 打爆内存）。 */
 function readBody(req) {
@@ -200,7 +200,7 @@ export function apply(ctx, rawConfig) {
     return
   }
 
-  const trustedHosts = ctx.webRuntime?.trustedHosts ?? []
+  const trustedHosts = ctx.webStartup?.trustedHosts ?? []
 
   const handler = async (req, res) => {
     if (!isTrustedRequest(req, trustedHosts)) {
