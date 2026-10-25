@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Unified Search",
+    "description": "Search the scratchpad, session messages and compaction summaries (cross-lingual semantics + exact text); results expand in place"
+  }
+}

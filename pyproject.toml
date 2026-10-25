@@ -46,6 +46,8 @@ test = ["pytest>=8"]
 
 [project.scripts]
 melquiades = "melquiades.cli:main"
+# HTTP 桥：把统一检索暴露成 JSON 端点，供 DSH Web UI 插件转发（只读、仅回环）
+melquiades-http = "melquiades.omnibus_http:main"
 
 [tool.setuptools.packages.find]
 include = ["melquiades*"]

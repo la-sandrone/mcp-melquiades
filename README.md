@@ -162,6 +162,28 @@ DSH 会自动压缩长会话——把早期消息压成一段约 35:1 的摘要�
 | `archive_grep` | 在**某个压缩点**的遮蔽区内按关键词搜原文 |
 | `archive_status` | 收割器与档案的健康检查 |
 
+### 2.1 HTTP 桥（可选，与 MCP 同生共死）
+
+模型能调上面这些工具，**人不能**。要给 Web UI 一个入口，就得把检索暴露成 HTTP。
+
+桥是 **MCP 进程内的 daemon 线程**，不是独立进程：
+
+```
+GET  /health   → {ok, db, sources, modes}
+POST /search   → {ok, hits, stats, notes, took_ms}
+POST /context  → {ok, text}
+```
+
+- **同生共死**：MCP 起来桥就在，MCP 死桥就没了 → 不留孤儿进程占端口
+- **端口被占只告警不致命**：MCP 是本命，桥是附件
+- **只读**：没有任何写入端点；只绑回环并校验 Host（防 DNS rebinding）
+- 关掉：`config.yaml` 里 `bridge: { enabled: false }`
+
+配套的 DSH 侧插件在 `dsh-omnibus-search`（侧边栏「统一检索」tab）。
+
+> 也可以脱离 MCP 单独跑（调试用）：`melquiades-http --port 9010`。
+> 但两种模式**不要同时开**——会抢端口，后起的那个只告警不启动。
+
 ---
 
 ## 3. 安装

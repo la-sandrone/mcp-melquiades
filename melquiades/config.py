@@ -180,7 +180,7 @@ class DshConfig:
     #   dsh-domus-<版本去前导 v>    （例 v0.1.7-rc.2 → dsh-domus-0.1.7-rc.2）
     # 理由见 resolve_dsh_home 的 ①b：写死 home 的代价是改名/升级当天静默断流
     # （2026-09-26 实测 files=0/0，只报一句 "sessions 目录不存在"）。
-    harness_dir: Optional[str] = None        # 例 /home/<user>/deepseek-harness
+    harness_dir: Optional[str] = None        # 例 /path/to/deepseek-harness
     home: Optional[str] = None               # 显式指定则优先（逃生口）；留空 = 派生
     sessions_dir: str = "sessions"
     # ⚠️ 已淘汰（2026-09-26）：日志发现改为【按文件名解析代数、取最大】
@@ -321,6 +321,22 @@ class SearchConfig:
 
 
 @dataclass
+class BridgeConfig:
+    """HTTP 桥：把统一检索暴露成 JSON 端点，供 DSH Web UI 转发。
+
+    **与 MCP 同生共死**：桥不是独立进程，而是 MCP 进程内的 daemon 线程。
+    MCP 退出 ⇒ 线程随之回收；桥崩了也只影响 UI，不影响 MCP 本体。
+
+    `port` 被占用时**只告警不致命**——MCP 是本命，桥是附件。
+    那种情况下 DSH 的搜索 tab 会不可用，但其余工具照常。
+    """
+
+    enabled: bool = True
+    host: str = "127.0.0.1"     # 只绑回环：桥是只读的，但别把它变成一个对外打洞的代理
+    port: int = 9010
+
+
+@dataclass
 class Config:
     """总配置。"""
 
@@ -329,6 +345,7 @@ class Config:
     dsh: DshConfig = field(default_factory=DshConfig)
     harvest: HarvestConfig = field(default_factory=HarvestConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
+    bridge: BridgeConfig = field(default_factory=BridgeConfig)
 
     # ── 派生 ──
 

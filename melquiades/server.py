@@ -59,6 +59,7 @@ _db: Optional[MariaDB] = None
 _retriever: Optional[Retriever] = None
 _store: Optional[HarvestStore] = None
 _runner: Optional[HarvestRunner] = None
+_bridge: Optional[object] = None   # HTTP 桥的 HTTPServer 句柄（见 _start_http_bridge）
 
 # ── 词表（SKOS 同义词环）缓存 ──
 # 写入路径每次都要拿"现有标签"来比近邻，而全量标签要从 1000+ 行 draftpad 现算。
@@ -734,14 +735,20 @@ def search_OMNIA(query: str = "", limit: int = 5, sources: str = "",
         "    （抄录器 60 秒一轮，本场会话通常延迟 <1 分钟）。"
     )
 )
-def message_context(guid: str = "", before: int = 3, after: int = 3,
-                    max_chars: int = 1200) -> str:
-    assert _db is not None
+def _message_context_text(db, guid: str = "", before: int = 3, after: int = 3,
+                          max_chars: int = 1200) -> str:
+    """按 guid 取一条会话正文并展开前后 N 条。**纯逻辑，db 由调用方给**。
+
+    为什么带 db 参数而不是读模块全局 `_db`：
+      HTTP 桥跑在独立线程、用独立连接（mariadb 连接对象不是线程安全的）。
+      如果这里读 `_db`，桥要么污染 MCP 主线程的全局，要么跟主线程抢同一个连接。
+      传参之后两边各用各的连接，零竞态。
+    """
     guid = (guid or "").strip()
     if not guid:
         return "需要 guid（search_OMNIA 的「会话正文」命中里带）"
     try:
-        head = _db.query_one(
+        head = db.query_one(
             "SELECT session_id, source_gens, line_no, ev_type, kind, role, ev_time "
             "FROM dsh_message WHERE guid = ?",
             (guid,),
@@ -764,13 +771,13 @@ def message_context(guid: str = "", before: int = 3, after: int = 3,
     #   （实测 before=2/after=2 只返回 1 条）。正解是按 line_no 排序取**相邻 N 条**：
     #   向前取「line_no <= 目标」的最后 b 条，向后取「line_no > 目标」的最前 a 条。
     try:
-        back = _db.query(
+        back = db.query(
             f"SELECT {cols} FROM dsh_message "
             "WHERE session_id = ? AND source_gens = ? AND line_no <= ? "
             "ORDER BY line_no DESC, ordinal DESC LIMIT ?",
             (sid, gens, target, b + 1), readonly=True,
         )
-        fwd = _db.query(
+        fwd = db.query(
             f"SELECT {cols} FROM dsh_message "
             "WHERE session_id = ? AND source_gens = ? AND line_no > ? "
             "ORDER BY line_no ASC, ordinal ASC LIMIT ?",
@@ -797,6 +804,34 @@ def message_context(guid: str = "", before: int = 3, after: int = 3,
         )
         lines.append(f"   {body or '(空正文)'}")
     return "\n".join(lines)
+
+
+@mcp.tool(
+    description=(
+        "按 guid 取一条会话正文，并展开它前后的上下文（同一会话、同一代日志）。\n\n"
+        "用途: search_OMNIA 或 draftpad_find 命中「会话正文」后，\n"
+        "      看那一段到底前后说了什么——否则只有片段容易误读。\n\n"
+        "参数:\n"
+        "  guid:     dsh_message.guid（search_OMNIA 的命中里带；64 位十六进制）。\n"
+        "  before:   往前取多少条（默认 3，上限 30）。\n"
+        "  after:    往后取多少条（默认 3，上限 30）。\n"
+        "  max_chars: 每条正文截断字符数（默认 1200，上限 8000）。\n\n"
+        "说明:\n"
+        "  · 按 line_no（解压后物理行号）取相邻，同会话同 source_gens 内。\n"
+        "  · 目标行以 ▶ 标记；正文里的换行压成空格以便阅读。\n"
+        "  · 这是**只读快照**：DSH 仍在追加的会话，最新几条可能还没抄进来\n"
+        "    （抄录器 60 秒一轮，本场会话通常延迟 <1 分钟）。"
+    )
+)
+def message_context(guid: str = "", before: int = 3, after: int = 3,
+                    max_chars: int = 1200) -> str:
+    """MCP 工具壳：把 MCP 自己的连接交给 `_message_context_text`。
+
+    HTTP 桥走同一个实现，但传它自己的连接（见 omnibus_http.do_context）——
+    两边各用各的连接，零竞态。
+    """
+    assert _db is not None
+    return _message_context_text(_db, guid, before, after, max_chars)
 
 
 @mcp.tool(
@@ -1141,6 +1176,56 @@ def _start_triggers() -> None:
         _scheduler.start()
 
 
+# ── HTTP 桥（与 MCP 同生共死）─────────────────────────────────────────
+#
+# 为什么是进程内线程而不是独立进程：
+#   · 同生共死不需要额外的看护者 —— MCP 起来桥就在，MCP 死桥就没了，
+#     不会留孤儿进程占着 9010 端口
+#   · 省掉一层「谁先起、起没起来、起来了几份」的状态同步
+#
+# 为什么端口被占不致命：MCP 是本命，桥只是 DSH 侧搜索 tab 的后端。
+# 9010 被占（比如手动跑了一份 standalone）时，告警一行继续跑，
+# 其余所有 MCP 工具照常工作。
+
+def _start_http_bridge() -> None:
+    """在 MCP 进程内起检索桥。任何失败都只告警，绝不让 MCP 起不来。"""
+    global _bridge
+    assert _cfg is not None
+
+    if not _cfg.bridge.enabled:
+        logger.info("http bridge: 已禁用（config [bridge] enabled=false）")
+        return
+
+    try:
+        from .omnibus_http import start_in_thread
+
+        _bridge = start_in_thread(_cfg, host=_cfg.bridge.host, port=_cfg.bridge.port)
+    except OSError as exc:
+        logger.warning(
+            "http bridge 启动失败（%s）—— MCP 继续运行，但 DSH 的「统一检索」tab 会不可用。"
+            "通常是 %s:%d 已被占用（手动跑了一份 melquiades-http？）",
+            exc,
+            _cfg.bridge.host,
+            _cfg.bridge.port,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("http bridge 启动异常（%s: %s）—— MCP 继续运行", type(exc).__name__, exc)
+
+
+def _stop_http_bridge() -> None:
+    global _bridge
+    if _bridge is None:
+        return
+    try:
+        from .omnibus_http import stop_bridge
+
+        stop_bridge(_bridge)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("http bridge 停止出错（忽略）: %s", exc)
+    finally:
+        _bridge = None
+
+
 def main() -> None:
     """启动 melquiades 服务（stdio）。"""
     import sys
@@ -1157,10 +1242,12 @@ def main() -> None:
 
     _init_state(config_path)
     _start_triggers()
+    _start_http_bridge()
 
     try:
         mcp.run()
     finally:
+        _stop_http_bridge()
         if _scheduler is not None:
             _scheduler.stop()
 

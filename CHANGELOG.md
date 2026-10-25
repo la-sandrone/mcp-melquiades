@@ -5,6 +5,68 @@
 
 ---
 
+## 2026-10-25 — HTTP 桥：把统一检索接进 DSH Web UI
+
+### 动机
+
+`search_OMNIA` 只有模型能调。人和模型的检索入口不对称：想说「这话我之前是不是
+说过」，得先让模型代劳。要给人一个入口，就需要把检索能力暴露成 HTTP。
+
+**为什么不把检索逻辑搬到 JS 侧**：三路候选 + RRF 融合 + 归一化排序只有一份实现，
+在 `omnibus.py`。让插件直连 MariaDB 再写一遍 = 制造第二份真相源（本项目吃过
+「数据巴别塔」的亏）。所以 Node 只做 UI 与转发。
+
+### 变更
+
+**新增 `melquiades/omnibus_http.py`**（零新依赖，标准库 `http.server`）
+
+```
+GET  /health   → {ok, db, sources, modes}
+POST /search   → {ok, hits, stats, notes, took_ms, limit_semantics}
+POST /context  → {ok, text}
+```
+
+**与 MCP 同生共死**：桥不是独立进程，而是 MCP 进程内的 **daemon 线程**
+（`_start_http_bridge()` / `_stop_http_bridge()`，照 `harvest/scheduler.py` 的模式）。
+
+- MCP 起来桥就在，MCP 死桥就没了 → 不留孤儿进程占端口
+- 端口被占（EADDRINUSE）**只告警不致命**：MCP 是本命，桥是附件
+- `[bridge] enabled: false` 可整段关掉（省一条数据库连接）
+
+**线程安全**：桥**自建一条 MariaDB 连接**，不复用 MCP 的 `_db`。
+mariadb 连接对象不是线程安全的，主线程随时在跑工具、两条线程共用一个连接会互踩 cursor。
+
+**顺带修掉一处隐患**：`do_context` 原本把桥的 db 赋值给 `server._db` 全局再调工具壳。
+独立进程时无害，**进程内模式下是实打实的数据竞争**——主线程随时可能读 `_db`，
+而桥线程刚把它换掉。改成把 `message_context` 的查询体抽成
+`_message_context_text(db, ...)`，两边各传各的连接：
+
+```python
+# MCP 工具壳
+def message_context(...):  return _message_context_text(_db, ...)
+# HTTP 桥
+text = mcp_server._message_context_text(st["db"], ...)
+```
+
+**踩到并修掉的坑**：`modes` 传字符串时被逐字符遍历
+（`"fulltext"` → `['f','u','l',...]`），过滤后一个合法 mode 都不剩，表现为
+`hits=0` 且 `took_ms=0.0`。静默出错最难查。已加 `_as_list()` 显式分流，
+接受「逗号分隔字符串」与「JSON 数组」两种形状。
+
+### 验证
+
+- 进程内模式 6/6：起得来 / health / 全文命中 / **context 不改 `server._db` 全局** /
+  停掉后端口不响应 / 端口被占时降级不抛
+- 全链路（真桥 + 真 DB + 真向量路）5/5：跨语言（中文查「拜占庭」→ 命中俄文书那场对话）、
+  CJK 短词「口径」、messages 命中后展开上下文
+- 实测耗时：全路首次 2.0s（含 embedding 冷启动），之后 ~174ms
+
+### 生效条件
+
+**MCP 进程需重启**——已启动的进程不会重载模块。DSH 侧重启后桥随之上线。
+
+---
+
 ## 2026-10-25 — CJK 检索改 bigram、新增跨源检索、多语言修正
 
 ### 动机

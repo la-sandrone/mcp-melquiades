@@ -1,0 +1,28 @@
+# dsh-omnibus-search bundle patch
+#
+# 把插件行插进 web profile 的 roster。安装：
+#   dsh plugin --profile web add link:/path/to/melquiades/plugins/dsh-omnibus-search
+#
+# ══ 三层开关（任一层关掉都不影响主 UI）══
+#   ① 这一整行：注释掉或删除 ⇒ 插件根本没加载
+#   ② config.enabled: false ⇒ host 侧不注册 /omnia/api，client 侧不注册 tab
+#   ③ dsh-better-sidebar 缺失 ⇒ 只跑 host 路由，UI 无入口（feature detection，不崩）
+#
+# host 侧（exports "."，跑在 Node 里）注册 /omnia/api 的转发路由；
+# client 侧（exports "./client"，由 dsh.client 声明加载进浏览器）注册侧边栏 tab。
+- insert:
+    - id: omnibus-search
+      name: 'dsh-omnibus-search'
+      config:
+        # ② 总开关
+        enabled: true
+        # 桥地址。melquiades-http 默认就绑 127.0.0.1:9010（只读、仅回环）。
+        # 起法见 README：melquiades-http --port 9010
+        endpoint: 'http://127.0.0.1:9010'
+        # 单次搜索超时（毫秒）。向量路首次调用会冷启动 embedding 模型（实测 2.1s），
+        # 之后 ~170ms；给 15s 足够容纳冷启动 + 网络抖动。
+        timeoutMs: 15000
+        # 每路各取多少条（limit 是 per-route，三路去重后全给、不截断回 limit）
+        defaultLimit: 5
+        # 默认走哪几路：vector（跨语言语义）/ fulltext（单语言精确）/ like（字面兜底）
+        defaultModes: 'vector,fulltext,like'
