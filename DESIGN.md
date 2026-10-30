@@ -371,6 +371,9 @@ pool_size: 5
 ```
 而 `db.py` 使用连接池 —— **与铁律一冲突**。
 
+> **后续（2026-10-30）**：`dbcore.py` 的即弃连接落地后，`db.py` 与只消费它的 `search.py`
+> 已成死代码（全仓无 import、无动态加载），已整体删除。本决策不再有"遗留"尾巴。
+
 **决定（已拍板）：改** —— `db.py` 与 `config.yaml` 均去掉连接池，改为即弃连接（每次操作 `connect → execute → close`）。若个别路径确需池化，须**显式列出理由并记录**。
 
 ### 铁律二 · 复用靠 copy，不靠 import
@@ -397,7 +400,7 @@ draftpad:
   scan_default_limit: ...
 
 dsh:
-  home: /home/<user>/deepseek-harness/dsh-domus   # 显式，不猜
+  home: <harness-dir>/dsh-domus   # 显式，不猜
   sessions_dir: sessions
   scan_interval_sec: 60
   first_scan_budget_files: 10   # 首扫限速

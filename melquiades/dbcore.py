@@ -72,27 +72,38 @@ class MariaDB:
         """新建一个连接。**调用方负责关闭**（或使用下面的封装）。
 
         建立连接阶段失败会**重试**（次数与总预算见 config）——理由：
-        本机偶发 SYN 丢包，TCP 重传节拍 1/3/7/15s，单次失败未必是真故障；
-        而重试在此阶段是幂等的（一条语句都还没发）。
+        本机 127.0.0.1 的流量在 mirrored 模式下被策略路由送进 Windows 侧 loopback
+        relay（见 config.yaml 的病因注释），relay 偶发改错端口 ⇒ 单次失败未必是真故障；
+        而重试在此阶段是幂等的（一条语句都还没发），且换端口本身就是"换一条路"。
         ★ 查询**途中**失败绝不自动重试——写操作重放会双插，且无法判断
           服务端是否已执行。需要重试语义请在业务层显式实现。
+
+        预算语义（2026-10-30 修正）：`connect_retry_budget_sec` 是**真硬上限**——
+        单次尝试的 connect_timeout 会按剩余预算裁剪，整条路径不会超过预算。
         """
         c = self._cfg
         attempts = max(1, int(c.connect_retries) + 1)
         budget = float(c.connect_retry_budget_sec)
+        base_timeout = max(1, int(c.connect_timeout))
         t0 = time.monotonic()
         last_exc: Optional[BaseException] = None
+        failures = 0
         for i in range(attempts):
+            remaining = budget - (time.monotonic() - t0)
+            if remaining <= 0:
+                break
+            # 硬上限：最后一次尝试不许把总耗时顶出预算（至少留 1s）。
+            timeout = max(1, int(min(base_timeout, remaining)))
             try:
                 # 注意（2026-09-22 实测）：mariadb 连接器**没有** charset 参数，
                 # 字符集须通过 init_command="SET NAMES ..." 设置。
-                return mariadb.connect(
+                conn = mariadb.connect(
                     host=c.host,
                     port=int(c.port),
                     database=c.database,
                     user=c.user,
                     password=c.password,
-                    connect_timeout=int(c.connect_timeout),
+                    connect_timeout=timeout,
                     read_timeout=int(c.read_timeout),
                     write_timeout=int(c.write_timeout),
                     autocommit=True,
@@ -102,17 +113,29 @@ class MariaDB:
                 last_exc = exc
                 if not self._retriable_connect_error(exc):
                     raise
+                failures += 1
                 elapsed = time.monotonic() - t0
                 wait = float(c.connect_retry_backoff_sec) * (i + 1)
-                if i + 1 >= attempts or elapsed + wait > budget:
+                if i + 1 >= attempts or elapsed + wait >= budget:
                     break
-                logger.warning(
-                    "DB 连接失败（第 %d/%d 次，已耗时 %.1fs），%.1fs 后重试：%s",
-                    i + 1, attempts, elapsed, wait, exc)
+                # 噪声闸门（2026-10-30）：短超时下一个黑洞窗口会连出好几条同样的告警。
+                # 首次失败用 WARNING（用户要看得见），后续降 INFO；最终成功时补一条汇总。
+                emit = logger.warning if failures == 1 else logger.info
+                emit("DB 连接失败（第 %d/%d 次，单次上限 %ds，累计 %.1fs），"
+                     "%.1fs 后重试：%s",
+                     i + 1, attempts, timeout, elapsed, wait, exc)
                 time.sleep(wait)
+            else:
+                if failures:
+                    logger.warning("DB 连接已恢复（此前失败 %d 次，累计 %.1fs）",
+                                   failures, time.monotonic() - t0)
+                return conn
+        if last_exc is None:
+            raise RuntimeError(
+                f"DB 连接预算 {budget:.0f}s 不足以发出任何一次尝试"
+                f"（connect_timeout={base_timeout}s）")
         logger.error("DB 连接连续失败 %d 次（累计 %.1fs，预算 %.0fs），放弃：%s",
-                     attempts, time.monotonic() - t0, budget, last_exc)
-        assert last_exc is not None
+                     failures, time.monotonic() - t0, budget, last_exc)
         raise last_exc
 
     @contextmanager

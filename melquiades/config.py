@@ -133,24 +133,29 @@ class MariadbConfig:
     user: str = "melquiades"
     password: str = ""            # 无默认值语义：必须由 config.yaml 提供
     charset: str = "utf8mb4"
-    # ── 连接超时与**建立连接阶段**的重试（2026-09-22 实测标定）──
+    # ── 连接超时与**建立连接阶段**的重试（2026-10-30 重标定，推翻 09-22 的 10→30）──
     # `connect_timeout` 覆盖 TCP connect + 握手 + 认证整个阶段。
-    # ★ 为什么从 10 提到 30：本机 127.0.0.1:9002 偶发**入向 SYN 被丢**，
-    #   TCP 重传节拍是 1/3/7/15s —— 丢 1 个 SYN ⇒ 7.14s（实测抓到），
-    #   丢 2 个 ⇒ 第 4 次重传要 15s，**10s 闸门先到 ⇒ 报 errno 110**。
-    #   提到 30 后 15s 那次重传能赶上，实测的失败模式直接消失。
-    #   取证过程见 tools/replay/conn_forensics.py 与草稿纸 id=1092。
-    #   ⚠️ 这是**容忍**（loopback 本该不丢包），不是修复。
-    connect_timeout: int = 30
-    # 建立连接失败的重试次数（用户令：三次）。**只重试"建立连接"阶段**——
+    # ★ 病因（2026-10-30 定案）：WSL2 mirrored 下 127/8 的 TCP/UDP 被策略路由拽出 lo
+    #   （ip route get 127.0.0.1 → ... dev loopback0 table 127），连本机 Windows 服务
+    #   实际走 loopback relay；relay 偶发改错端口/校验和 ⇒ 内核认不出 ⇒ SYN 重传全废
+    #   ⇒ 吃满 connect_timeout ⇒ errno 110。重试换端口常常就好。
+    #   上游 open：microsoft/WSL#40343 / #41137 / #10855。
+    # ★ 为什么 30 → 5：**T 只决定单次失败的"价格"，不是成功率**。
+    #   实测：T=30 时生产日志 792 次失败全是"第 1/4 次、耗时 30.0s"（每次吃满闸门）；
+    #   T=5 上线后首批事件是"第 1/7 次、5s" → 1s 后恢复，**累计 6.0s**。
+    #   中招按**连接**发生（20:19:44 刚成功、20:19:49 又失败 ⇒ 不是持续窗口），
+    #   所以短超时省"价格"、多尝试压"连续中招"的尾部。两头都赚，无取舍。
+    #   ★ 拆除条件与完整取证见 config.yaml 同段注释（两条都满足才调回 15~30）。
+    connect_timeout: int = 5
+    # 建立连接失败的重试次数。**只重试"建立连接"阶段**——
     # 此时尚未发出任何语句，重试幂等；查询途中失败**绝不自动重试**
     # （写操作重放会双插，且无法判断服务端是否已执行）。
-    connect_retries: int = 3
+    connect_retries: int = 6
     connect_retry_backoff_sec: float = 1.0
-    # 整个重试循环的**总耗时预算**（硬上限）。没有它，最坏情况是
-    # (1+3) × connect_timeout = 4×30 = 120 秒，足以把一个交互式工具调用挂死两分钟。
-    # 设 45s ⇒ 实际最多发生 2 次整超时尝试，第 3/4 次会被预算挡掉。
-    connect_retry_budget_sec: float = 45.0
+    # 整个重试循环的**总耗时预算**，真硬上限：dbcore 按剩余预算裁剪单次 connect_timeout
+    # （2026-10-30 修正：旧实现只在退避前查预算，30s×4 实测跑到 61s）。
+    # 6 次重试 + 5s 超时最坏 ≈ 56s ⇒ 设 60，保住旧配置（30s×2 ≈ 61s）的覆盖时长。
+    connect_retry_budget_sec: float = 60.0
     read_timeout: int = 30
     write_timeout: int = 30
     # DDL/迁移开关（测试环境可关）

@@ -233,7 +233,7 @@ LIKE 转义 5/5（`50%` 不误命中 `50 percent`、`a_b` 不误伤 `axb`、`O'N
 ## 四、用法
 
 ```bash
-cd /path/to/melquiades
+cd <project-root>
 export PYTHONPATH=.
 
 # 建表 + 向量列（幂等）
@@ -281,6 +281,6 @@ MCP 工具（7 个）：
 | 4 | context rot 曲线 | 数据已齐（`dsh_harvest_log` + `dsh_compaction` 的 tokens/时间），分析脚本未写 |
 | 5 | `scratch_notes` 改名 | 已定"保留原地 + 改名标明非生产"（建议 `misc_notes`），**尚未执行** |
 | 6 | `README.md` 重写 | 已定"落实代码时改"，本次未改 |
-| 7 | `db.py` 去池化 | **新代码走 `dbcore.py`（已即弃）**；旧 `db.py`（592 行）仍在，属遗留（其类已不被新 server 使用） |
+| 7 | `db.py` 去池化 | **已完成（2026-10-30）**：新代码走 `dbcore.py`（即弃连接）；旧 `db.py` 及只消费它的 `search.py` 已**整体删除**（均无任何 import、无动态加载、README 目录树与 DESIGN 决策记录已同步） |
 | 8 | `draftpad_vectors` 空表 | 保留未用（已拍板） |
 | 9 | **System Prompt 同步**（已完成） | 5 个 `.txt` 源文件（UTF-16-LE）+ 5 个 preset 的「主动回忆」段换成 `archive_*` 四段式，并在**四处**强调"摘要是有损的（约 35:1），命中压缩点后必须回查原文"；`tools/apply_prompt_v6.py` 幂等可重跑，备份 `*.bak-archive-20260922-1646` |

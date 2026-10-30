@@ -12,22 +12,26 @@ mariadb:
   # 无特殊理由**绝不使用长连接/连接池**：用完即烧。
   # 理由（血教训）：长连接出错后捞不回来，且会占满连接池。
   # 故此处不配置 pool_name / pool_size；引擎见 dbcore.MariaDB。
-  # ─── 连接超时与建立连接阶段的重试（2026-09-22 实测标定）───
+  # ─── 连接超时与建立连接阶段的重试（2026-10-30 重标定）───
   # connect_timeout 覆盖 TCP connect + 握手 + 认证整个阶段。
-  # ★ 10 → 30 的依据：本机 127.0.0.1:9002 偶发**入向 SYN 被丢**，
-  #   TCP 重传节拍 1/3/7/15s —— 丢 1 个 ⇒ 7.14s（实测抓到 T1=7141ms），
-  #   丢 2 个 ⇒ 第 4 次重传要 15s，**10s 闸门先到 ⇒ errno 110**。
-  #   提到 30 后 15s 那次重传赶得上，实测的失败模式直接消失。
-  #   取证：tools/replay/conn_forensics.py；记录：草稿纸 id=1092。
-  #   ⚠️ 这是**容忍**（loopback 本该不丢包），不是修复。
-  connect_timeout: 30
-  # 建立连接失败的重试（用户令：三次）。**只重试建立连接阶段**——
+  # ★ 病因：WSL2 mirrored 模式下 127/8 的 TCP/UDP 被策略路由拽出 lo
+  #   （ip route get 127.0.0.1 → ... dev loopback0 table 127），于是连本机 Windows 服务
+  #   实际走了 loopback relay；relay 偶发改错端口 ⇒ 内核认不出 ⇒ SYN 重传全废
+  #   ⇒ 吃满 connect_timeout ⇒ errno 110。重试换端口常常就好。
+  #   上游 open：microsoft/WSL#40343 / #41137 / #10855。
+  # ★ 短超时 + 多尝试优于长超时 + 少尝试：T 只决定单次失败的"价格"，不改变中招概率；
+  #   中招按连接发生（不是持续窗口），所以短超时省钱、多尝试压尾部。
+  connect_timeout: 5
+  # 建立连接失败的重试。**只重试建立连接阶段**——
   # 此时一条语句都没发出，重试幂等；查询途中失败绝不自动重试（写重放会双插）。
-  connect_retries: 3
-  connect_retry_backoff_sec: 1      # 退避 = 本值 × 第几次（1s/2s/3s）
-  # 整个重试循环的总耗时预算（硬上限）。没有它最坏是 (1+3)×30 = 120 秒，
-  # 足以把一个交互式工具调用挂死两分钟。45s ⇒ 最多 2 次整超时尝试。
-  connect_retry_budget_sec: 45
+  connect_retries: 6
+  connect_retry_backoff_sec: 1      # 退避 = 本值 × 第几次（1s/2s/3s/4s/5s/6s）
+  # 整个重试循环的总耗时预算，**真硬上限**（dbcore 按剩余预算裁剪单次超时）。
+  connect_retry_budget_sec: 60
+  #
+  # ★ 拆除条件：① #40343 / #41137 关闭且 release note 提到 port/checksum 修复；
+  #   ② 「睡 60s → 连一次」×300 轮 0 命中（连打不睡测不出来）。
+  #   都满足才可把 connect_timeout 调回 15~30 并摘掉 dbcore 的噪声闸门。
   read_timeout: 30
   write_timeout: 30
 
@@ -166,21 +170,6 @@ draftpad:
 # 会话管理 —— v2 起**不再有"会话隔离/换号"**
 # session_id 降级为 bucket（见上面 draftpad.default_bucket），检索默认跨桶。
 # 旧设计的 switch_session / 旧号只读已废弃 —— 那正是"开新对话找不到之前的东西"的病根。
-
-# ──────────────────────────────────────────
-# HTTP 桥（可选）—— 与 MCP 同生共死
-#
-# 把统一检索（草稿纸 / 会话正文 / 压缩摘要）暴露成 JSON 端点，供 DSH Web UI
-# 的搜索插件转发。桥**不是独立进程**，而是 MCP 进程内的 daemon 线程：
-#   · MCP 起来桥就在，MCP 死桥就没了 —— 不会留孤儿进程占端口
-#   · 端口被占用时**只告警不致命**：MCP 照常跑，只是 UI 的搜索 tab 不可用
-#
-# 只读：不提供任何写入端点；只绑回环，并自己校验 Host（防 DNS rebinding）。
-# 用不到（不装 DSH 搜索插件）就 enabled: false —— 省一条数据库连接。
-bridge:
-  enabled: true
-  host: "127.0.0.1"     # 只绑回环。改成别的地址等于把它变成对外打洞的代理，别做
-  port: 9010
 
 # ──────────────────────────────────────────
 # 日志

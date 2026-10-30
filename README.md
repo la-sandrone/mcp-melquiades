@@ -394,8 +394,8 @@ melquiades/
 │   ├── server.py              # MCP 入口（10 个工具）
 │   ├── cli.py                 # ensure-tables / harvest / status / backfill
 │   ├── config.py              # 配置（魔法数字唯一出口）+ DSH home 解析
-│   ├── dbcore.py / db.py / schema.py          # 即弃连接 + 表结构演进
-│   ├── retrieval.py / search.py / rerank.py   # 检索栈
+│   ├── dbcore.py / schema.py                  # 即弃连接 + 表结构演进
+│   ├── retrieval.py / rerank.py               # 检索栈
 │   ├── tokenizer.py / vocab.py / sqlguard.py  # 分词 / 词表 / SQL 门禁
 │   └── harvest/               # ← 所有 DSH 格式知识都在这
 │       ├── reader.py          #   多帧 zstd 增量读 + 字节偏移游标

@@ -27,16 +27,21 @@ if [ -z "$DST" ]; then
 fi
 
 # ── 白名单：只有这些进得去 ────────────────────────────────────────────
+# ⚠️ 白名单必须与「公开仓实际跟踪的文件」对齐。导出第一步是
+#    `rm -rf "$DST"/*` —— 漏一条不会"少导出"，而是**把公开仓里的那份删掉**。
+#    2026-10-30 就漏过 CHANGELOG.md 与 plugins/（两者公开仓里都已在跟踪），
+#    是导出前对比 `git -C "$DST" ls-files` 才发现的。改白名单前先跑这条对比。
 # 根文件。`.gitattributes` 必须在这里，否则每次导出都会把它漏掉——
 # 而它恰恰是防"clone 后 .sh 变 CRLF"的那道保险，漏了等于没有。
 ALLOW_FILES=(
   README.md LICENSE .gitignore .gitattributes pyproject.toml
   config.example.yaml
+  CHANGELOG.md
   DESIGN.md IMPLEMENTATION.md NOTES.md
 )
 # 整目录拷贝。
 ALLOW_DIRS=(
-  melquiades tests
+  melquiades tests plugins
 )
 # tools/ 只挑**通用**件。一次性的定位/回放/修正脚本（replay/**、fix_archive_v*、
 # apply_prompt_v6 等）硬编码了个人语料路径，一律不出。
