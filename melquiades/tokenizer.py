@@ -403,41 +403,63 @@ def tokenize_cjk_ub_v2(text: str) -> str:
 #   ③ 停止词表仍必需（8/8 vs 7/8）—— NL 是 OR 语义，高频词会淹没结果。
 
 
-def split_by_stopwords(query: str, stopwords=()) -> list[str]:
-    """按停止词把查询切成**内容块**（用占位符切，**不是删字符**）。
-
-    为什么必须切块：`q.replace("算不算", "")` 会让「等离子体生命算不算生命」变成
-    「等离子体生命生命」，再切 bigram 就多出 `命生` 这种跨边界的垃圾 token。
-    """
-    s = query or ""
-    for w in sorted([x for x in (stopwords or ()) if x], key=len, reverse=True):
-        s = s.replace(w, "\x00")
-    parts = [p for p in s.split("\x00") if p.strip()]
-    return parts or ([query] if query else [])
-
-
 def build_cjk_query_v2(query: str, stopwords=(), bigrams_only: bool = True) -> str:
     """查询侧表达式（给 `AGAINST(? IN NATURAL LANGUAGE MODE)` 用）：**空格分隔，无 + 号**。
 
-    · 块内生成 bigram，**不跨块**
+    · 与索引侧共用 `iter_chunks` —— **不改 token 边界**（A2，2026-11-07）
+    · 块内生成 bigram
     · 单字块退回 unigram（否则 bigram 集为空）
     · 非汉字段整体保留（俄/希/拉丁/标识符）
+    · 停止词只做 **token 相等过滤**（`token == 停词` 才丢）
     · 过滤后为空 ⇒ **退回原查询**（绝不因过滤返回 0）
+
+    【为什么废弃了「按停词切块」】旧实现是 `s.replace(w, "\x00")` —— 任意位置的
+    子串替换，会把含该字的**真词**当场切碎（地质→质、太阳→阳、过程→程）。
+    审计实测：30 个真词里 28 个被切碎。而且这类错位**永远不报错**：查询侧再也
+    产不出「地质」这个 bigram，索引里明明有，就是捞不到。
+
+    切块的初衷（避免 `replace("算不算","")` 造出 `命生` 这种跨边界垃圾）现在由
+    「token 相等过滤」同样实现：`算不算` 本身是停词 ⇒ 它作为 bigram 出现时被丢掉，
+    而它的字不再参与任何删除动作。代价是跨边界 bigram（`球有`）会进查询串，
+    但它们的 df 极低，NL 模式下 BM25 自动把它们压到 0。
     """
-    parts = split_by_stopwords(query, stopwords)
+    if not query:
+        return ""
+    sw = {w for w in (stopwords or ()) if w}
+    # ★ 跨词边界噪声的抑制**只在多字停词上做**：多字停词（为什么/算不算）是整词，
+    #   把它覆盖的字位标死，等于不让 bigram 跨它拼接 —— 这恢复了旧实现的初衷，
+    #   却没有旧实现的伤害。单字停词**绝不参与**标位（那正是「地质→质」的病根）。
+    sw_multi = sorted((w for w in sw if len(w) >= 2), key=len, reverse=True)
     out: list[str] = []
-    for part in parts:
-        for is_cjk, chunk in iter_chunks(part):
-            if is_cjk:
-                if len(chunk) == 1:
-                    out.append(chunk)          # 单字兜底：否则 bigram 集为空
-                else:
-                    if not bigrams_only:
-                        out.extend(chunk)      # 需要 unigram 时（调试/对照用）
-                    out.extend(chunk[i:i + 2] for i in range(len(chunk) - 1))
-            else:
-                out.extend(_WORD_ONLY_RE.findall(chunk))
-    deduped = list(dict.fromkeys(t for t in out if t))
+    for is_cjk, chunk in iter_chunks(query):
+        if is_cjk:
+            if len(chunk) == 1:
+                out.append(chunk)          # 单字兜底：否则 bigram 集为空
+                continue
+            dead = bytearray(len(chunk))
+            for w in sw_multi:
+                start = chunk.find(w)
+                while start != -1:
+                    dead[start:start + len(w)] = b"\x01" * len(w)
+                    start = chunk.find(w, start + 1)
+            if not bigrams_only:
+                out.extend(chunk[i] for i in range(len(chunk)) if not dead[i])
+            out.extend(chunk[i:i + 2] for i in range(len(chunk) - 1)
+                       if not (dead[i] or dead[i + 1]))
+        else:
+            out.extend(_WORD_ONLY_RE.findall(chunk))
+    deduped = [t for t in dict.fromkeys(out) if t and t not in sw]
     if not deduped:
-        return tokenize_cjk_ub_v2(query)
+        # 兜底①：退回 **unigram**（"鲸"/"体" 这类查询不能归零）。
+        #   注意不是退回 tokenize_cjk_ub_v2(query)——那会把刚清掉的停词位与
+        #   跨边界 bigram 全带回来，等于兜底把规则抵消掉。
+        uni: list[str] = []
+        for is_cjk, chunk in iter_chunks(query):
+            if is_cjk:
+                uni.extend(ch for ch in chunk if ch not in sw)
+            else:
+                uni.extend(_WORD_ONLY_RE.findall(chunk))
+        deduped = [t for t in dict.fromkeys(uni) if t]
+        if not deduped:
+            return tokenize_cjk_ub_v2(query)   # 兜底②：绝不返回空
     return " ".join(deduped)

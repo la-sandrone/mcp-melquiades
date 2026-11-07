@@ -38,3 +38,6 @@ tests/fixtures/_generated/
 Thumbs.db
 .idea/
 .vscode/
+
+# 运行时产物（重建日志 / 锁文件）
+logs/

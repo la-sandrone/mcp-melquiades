@@ -38,6 +38,7 @@ ALLOW_FILES=(
   config.example.yaml
   CHANGELOG.md
   DESIGN.md IMPLEMENTATION.md NOTES.md
+  TODO-SEARCH-AUDIT.md TODO-SEARCH-NEXT.md
 )
 # 整目录拷贝。
 ALLOW_DIRS=(
@@ -50,6 +51,8 @@ ALLOW_TOOLS=(
   tools/scan_paths.py
   tools/backfill_compaction_v2.py
   tools/verify_archive_v2.py
+  tools/bench_search.py          # 基准脚本（数据由 --build 从本机库生成，不随包）
+  tools/extract_replay_calls.py  # 回查调用抽取器（源目录必须显式 --dir）
 )
 
 # 绝不能进发布件的（命中即 FAIL）——凭据与本地运行时配置。
