@@ -100,7 +100,7 @@ class HarvestRunner:
         self._retriever = retriever
         self._last_piggyback_ts: float = 0.0
         # ★ 正文抄录用独立游标（dsh_message_cursor），与压缩收割互不干扰
-        self._msg_store = MessageStore(store.db)
+        self._msg_store = MessageStore(store.db, cfg)   # cfg 供侧表模式判定
 
     # ── 文件发现 ──
 

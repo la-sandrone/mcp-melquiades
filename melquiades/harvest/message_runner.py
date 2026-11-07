@@ -121,8 +121,11 @@ def read_delta(path: str, offset: int = 0, max_frames: int = 0) -> DeltaResult:
 class MessageStore:
     """dsh_message / dsh_attachment / dsh_message_cursor 的读写（即弃连接）。"""
 
-    def __init__(self, db) -> None:            # db: melquiades.dbcore.MariaDB
+    def __init__(self, db, cfg=None) -> None:  # db: melquiades.dbcore.MariaDB
         self._db = db
+        # cfg 只用于判「侧表模式」（search.messages_fts_table 非空）。
+        # 默认 None 是为了不破坏既有调用方；没传就按单表模式走。
+        self._cfg = cfg
 
     def get_cursor(self, log_path: str) -> tuple[int, int]:
         """返回 (byte_offset, line_base)；无记录则 (0, 0)。"""
