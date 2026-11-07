@@ -142,6 +142,16 @@ def do_search(payload: dict[str, Any]) -> dict[str, Any]:
     if not modes:
         modes = list(DEFAULT_MODES)
 
+    # ★ 升级窗口：**明确拒绝**，而不是静默返回旧表结果（DESIGN.md #29）。
+    #   窗口内 dsh_message 正在被重建；旧表虽完整但已过时，v2 是半成品。
+    #   无论读哪张，给出的「结果」都会误导 —— 宁可说「维护中」。
+    _maint = getattr(st.get("cfg"), "maintenance", None)
+    if _maint is not None and getattr(_maint, "enabled", False):
+        return {"ok": False,
+                "error": "维护中（%s 起）：%s。此期间检索不可用，请稍后重试。"
+                         % (getattr(_maint, "since", "?"), getattr(_maint, "reason", "") or "数据重建"),
+                "hits": [], "stats": {"maintenance": True}, "notes": [], "took_ms": 0.0}
+
     t0 = time.monotonic()
     res = st["searcher"].search(
         query,
@@ -149,6 +159,9 @@ def do_search(payload: dict[str, Any]) -> dict[str, Any]:
         sources=sources,
         modes=modes,
         per_source_limit=per_source,
+        # 工作区作用（DESIGN.md #15）：由 UI 传当前会话的 cwd；默认 off。
+        workspace_mode=str(payload.get("workspace") or "off"),
+        current_cwd=str(payload.get("cwd") or ""),
     )
     took = (time.monotonic() - t0) * 1000.0
 

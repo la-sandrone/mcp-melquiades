@@ -315,3 +315,129 @@ def build_cjk_boolean(query: str) -> str:
         else:
             terms.append("+" + chunk)
     return " ".join(terms)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 切分器 v2（2026-11-07）—— 修掉「拉丁/数字紧邻汉字时，汉字被吞成单 token」
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 【为什么要另起一个函数而不是原地改 tokenize_cjk_ub】
+#   原地改会让**已经在跑**的收割器与**已入库**的 tokenized 口径瞬间分叉，
+#   而重算 20.6 万行 + 重建 FULLTEXT 是小时级操作（见 DESIGN.md #13）。
+#   所以：新函数先落地、离线工具用它重算、切换后旧函数再退役。
+#
+# 【病根（实测）】旧实现 `([CJK]+)|(\w+)` 的注释写着「中文不会落进 \w+，
+#   因为第①段先命中」—— 这只在**匹配起点是汉字**时成立。起点是拉丁字母/
+#   数字/下划线时第①段失败，第②段 `\w+` 会把后面的汉字一起吞掉：
+#       tokenize_cjk_ub('X射线等离子体')  -> 'X射线等离子体'   （一个 token）
+#       tokenize_cjk_ub('45亿年的先进系统') -> '45亿年的先进系统'（一个 token）
+#       tokenize_cjk_ub('Lyfe定义')       -> 'Lyfe定义'      （一个 token）
+#   被吞的部分没有 unigram 也没有 bigram ⇒ **任何中文查询都搜不到它**。
+#   全库实测 39,409 行（19.1%）带这个签名。
+#
+# 【为什么用「切分」而不是前瞻正则】
+#   前瞻写法 `(?:(?!汉字)\w)+` 同样正确（实测两种输出 0 差异），但难读难维护；
+#   切分版把「汉字段」和「非汉字段」彻底分开处理，**溢出在结构上不可能发生**：
+#   非汉字段里根本不会出现汉字，汉字段里也根本不会走 \w。
+#
+# 【行为不变的部分（12 类语料实测）】
+#   俄文、希腊文（含词尾 ς）、带变音拉丁（é ü ñ ā ĕ）、纯汉字、全角标点、
+#   emoji ZWJ、天城文、下划线标识符、连字符串 —— 输出与旧实现**逐 token 相同**。
+#   只有「拉丁/数字/下划线紧邻汉字」四类发生变化（汉字恢复 unigram+bigram）。
+#
+# 【性能】800 条真实正文（2.9 MB）：旧 0.16s / 切分版 0.19s（+19%）。
+#   相对索引重建可忽略。
+
+_CJK_SPLIT_RE = re.compile(f"([{_CJK_HAN}]+)")
+_WORD_ONLY_RE = re.compile(r"\w+")
+
+
+def iter_chunks(text: str):
+    """把文本切成「汉字段 / 非汉字段」交替产出：`(is_cjk, chunk)`。
+
+    **索引侧与查询侧必须共用这一个切分器** —— 否则写入口径与查询口径分叉，
+    表现为「明明有却搜不到」（本模块文件头已记过同类事故）。
+    """
+    if not text:
+        return
+    for part in _CJK_SPLIT_RE.split(text):
+        if not part:
+            continue
+        yield bool(_CJK_SPLIT_RE.fullmatch(part)), part
+
+
+def tokenize_cjk_ub_v2(text: str) -> str:
+    r"""unigram + bigram（v2 切分口径）。语义同 `tokenize_cjk_ub`，只修切分。
+
+    · 汉字段 → 每个字一个 token + 每对相邻字一个 token
+    · 非汉字段 → 每个 `\w+` 一个 token（俄/希/拉丁/标识符整体保留）
+    """
+    if not text:
+        return ""
+    out: list[str] = []
+    for is_cjk, part in iter_chunks(text):
+        if is_cjk:
+            out.extend(part)
+            out.extend(part[i:i + 2] for i in range(len(part) - 1))
+        else:
+            out.extend(_WORD_ONLY_RE.findall(part))
+    return " ".join(out)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 查询侧 v2（2026-11-07）—— 停止词切块 + 只 bigram + NATURAL LANGUAGE MODE
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 【为什么从「拼 AND 布尔式」改成「交给引擎排序」】
+#   12 条查询实测（DESIGN.md #11 修订）：
+#     A 现状 AND           目标进前 50：3/8 NL 问句
+#     B 停词 + 块内 bigram + AND：11/12，中位排名 ~7，常见词数百 ms
+#     D 停词 + 只 bigram + NATURAL LANGUAGE MODE：**12/12，中位 4.5，61 ms**
+#   机制：NL 模式由引擎按 BM25（InnoDB 全文仿 Sphinx）排序，OR 语义不设硬 AND；
+#   我们只负责**切块**与**丢 unigram**，不再替引擎拼算子。
+#
+# 【三条实测出来的护栏】
+#   ① 单字块必须退回 unigram —— 否则 bigram 集为空（「鲸」「体」这类查询归零）；
+#   ② **不要与 AND 路做任何融合**（含 RRF）—— 实测三种融合都把中位排名从 4.5 拉到 7~8，
+#      因为 AND 路的行基本是 NL 路的子集，给子集加固定分等于把排第 3 的压到第 8；
+#   ③ 停止词表仍必需（8/8 vs 7/8）—— NL 是 OR 语义，高频词会淹没结果。
+
+
+def split_by_stopwords(query: str, stopwords=()) -> list[str]:
+    """按停止词把查询切成**内容块**（用占位符切，**不是删字符**）。
+
+    为什么必须切块：`q.replace("算不算", "")` 会让「等离子体生命算不算生命」变成
+    「等离子体生命生命」，再切 bigram 就多出 `命生` 这种跨边界的垃圾 token。
+    """
+    s = query or ""
+    for w in sorted([x for x in (stopwords or ()) if x], key=len, reverse=True):
+        s = s.replace(w, "\x00")
+    parts = [p for p in s.split("\x00") if p.strip()]
+    return parts or ([query] if query else [])
+
+
+def build_cjk_query_v2(query: str, stopwords=(), bigrams_only: bool = True) -> str:
+    """查询侧表达式（给 `AGAINST(? IN NATURAL LANGUAGE MODE)` 用）：**空格分隔，无 + 号**。
+
+    · 块内生成 bigram，**不跨块**
+    · 单字块退回 unigram（否则 bigram 集为空）
+    · 非汉字段整体保留（俄/希/拉丁/标识符）
+    · 过滤后为空 ⇒ **退回原查询**（绝不因过滤返回 0）
+    """
+    parts = split_by_stopwords(query, stopwords)
+    out: list[str] = []
+    for part in parts:
+        for is_cjk, chunk in iter_chunks(part):
+            if is_cjk:
+                if len(chunk) == 1:
+                    out.append(chunk)          # 单字兜底：否则 bigram 集为空
+                else:
+                    if not bigrams_only:
+                        out.extend(chunk)      # 需要 unigram 时（调试/对照用）
+                    out.extend(chunk[i:i + 2] for i in range(len(chunk) - 1))
+            else:
+                out.extend(_WORD_ONLY_RE.findall(chunk))
+    deduped = list(dict.fromkeys(t for t in out if t))
+    if not deduped:
+        return tokenize_cjk_ub_v2(query)
+    return " ".join(deduped)

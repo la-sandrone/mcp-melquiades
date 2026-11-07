@@ -42,6 +42,8 @@ window.__ModuleLoader__.load({
 				'.osm-hit-head{display:flex;gap:8px;align-items:baseline;font-size:11px;color:var(--dsw-alias-label-secondary,#8a8a96)}',
 				'.osm-badge{padding:0 5px;border-radius:4px;background:var(--dsw-alias-bg-layer-3,#2c2c34);font-size:10.5px}',
 				'.osm-score{font-variant-numeric:tabular-nums}',
+				'.osm-guid{font-family:var(--dsw-font-mono,ui-monospace,monospace);font-size:10.5px;color:var(--dsw-alias-label-tertiary,#77777f);word-break:break-all}',
+				'.osm-where{font-size:11px;color:var(--dsw-alias-label-secondary,#9a9aa5)}',
 				'.osm-snip{font-size:12px;line-height:1.5;color:var(--dsw-alias-label-primary,#dcdce2);word-break:break-word}',
 				'.osm-mark{background:var(--dsw-alias-state-warning-bg,rgba(255,193,7,.28));color:inherit;border-radius:2px}',
 				'.osm-ctx{margin:4px 0 2px;padding:8px 10px;border-radius:6px;background:var(--dsw-alias-bg-layer-3,#1d1d24);font-family:var(--dsw-font-mono,ui-monospace,monospace);font-size:11.5px;line-height:1.55;white-space:pre-wrap;word-break:break-word;max-height:320px;overflow:auto}',
@@ -87,7 +89,10 @@ window.__ModuleLoader__.load({
 			})
 		}
 
-		function SearchTab() {
+		function SearchTab(props) {
+			// better-sidebar 把当前会话上下文作为 scope={sessionId,cwd} 传进来。
+			// 工作区加权（DESIGN.md #15）需要它；拿不到就不加权。
+			const scope = (props && props.scope) || null
 			const [query, setQuery] = useState('')
 			const [hits, setHits] = useState([])
 			const [notes, setNotes] = useState([])
@@ -115,7 +120,12 @@ window.__ModuleLoader__.load({
 				setExpanded(null)
 				setActiveIdx(-1)
 				try {
-					const data = await apiFetch('/omnia/api/search', { query: text })
+					const data = await apiFetch('/omnia/api/search', {
+						query: text,
+						// 同工作区加权：默认开（软加权，不丢跨工作区结果）
+						workspace: 'boost',
+						cwd: (scope && scope.cwd) || '',
+					})
 					if (seq !== seqRef.current) return // 有更新的请求了，丢弃
 					if (!data.ok) {
 						setError(data.error || '搜索失败')
@@ -281,8 +291,16 @@ window.__ModuleLoader__.load({
 								{ className: 'osm-hit-head' },
 								h('span', { className: 'osm-badge' }, (hit.matched_by || []).join('+') || '—'),
 								h('span', { className: 'osm-score' }, Number(hit.score || 0).toFixed(3)),
-								h('span', {}, String(hit.record_id).slice(0, 16)),
+								// ★ 完整 guid（DESIGN.md #24）：后端设计就是输出完整 64 位，
+								//   UI 截成 16 位等于把「结果有了却接不上下一步」搬到浏览器里。
+								h('span', { className: 'osm-guid' }, String(hit.record_id)),
 							),
+							// 工作区 › 会话标题（DESIGN.md #25）：没有它，人不知道「在找谁」。
+							(hit.meta && (hit.meta.workspace_title || hit.meta.session_title))
+								? h('div', { className: 'osm-where' },
+									(hit.meta.workspace_title || '未分类工作区'),
+									hit.meta.session_title ? ' › ' + hit.meta.session_title : '')
+								: null,
 							h('div', { className: 'osm-snip' }, renderSnippet(hit.snippet, query)),
 							isOpen
 								? h(

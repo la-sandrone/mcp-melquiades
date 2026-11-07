@@ -16,7 +16,9 @@ dsh_message 里**同时有 seq 和 guid**，天然是映射表：
     SELECT guid, line_no FROM dsh_message
     WHERE session_id=? AND source_gens=? AND seq IN (...)
 
-★ 不能用 dsh_message.is_shadowed 抄近路 —— 实测 4/4 样本该列全为 0
+★ 不能用 dsh_message.is_shadowed 抄近路 —— 2026-11-07 前该列恒为 0
+ *   （根因是 insert_messages 的 VALUES 错位一位，已修；存量数据需跑
+ *    `rebuild_dsh_message.py fix-flags` 回填）
   （列建了但从未写入）。
 
 ★ 对不上的 seq 是**正常**的：没有正文块的事件（纯控制事件）本就不产 guid 行。

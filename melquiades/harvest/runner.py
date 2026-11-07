@@ -193,6 +193,20 @@ class HarvestRunner:
             stats.errors.append("harvest disabled by config")
             return stats
 
+        # ★ 升级窗口守卫（DESIGN.md #29）。**必须放在这里而不是调度器**：
+        #   收割有三个入口 —— 定时器、工具搭车、启动扫。只挡调度器会漏掉后两个，
+        #   而「关掉 DSH 期间又手贱开了一次 DSH」正是后两个会触发的场景。
+        #   窗口内写进旧表的行，会在 RENAME 之后表现为「最新几分钟的内容消失」。
+        _m = getattr(self._cfg, "maintenance", None)
+        if _m is not None and not getattr(_m, "harvest_enabled", True):
+            if not getattr(self, "_maint_warned", False):
+                logger.warning(
+                    "harvest blocked by maintenance flag (reason=%r since=%s) —— "
+                    "本次运行不写任何行", getattr(_m, "reason", ""), getattr(_m, "since", ""))
+                self._maint_warned = True
+            stats.errors.append("harvest blocked by maintenance flag")
+            return stats
+
         if write_log:
             try:
                 self._store.log_start(stats.run_id, trigger)

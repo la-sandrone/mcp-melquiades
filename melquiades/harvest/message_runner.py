@@ -27,7 +27,7 @@ import zstandard as zstd
 
 from melquiades.harvest.message_extract import messages_from_events
 from melquiades.harvest.reader import session_id_from_path
-from melquiades.tokenizer import tokenize_cjk_ub
+from melquiades.tokenizer import tokenize_cjk_ub, tokenize_cjk_ub_v2
 
 logger = logging.getLogger(__name__)
 
@@ -154,24 +154,51 @@ class MessageStore:
         if not rows:
             return 0
         n = 0
+        # ★ 侧表模式（DESIGN.md「下一版架构」）：tokenized 住 dsh_message_fts，
+        #   主表不再有那一列 —— 所以 INSERT 的列清单必须按模式切换，
+        #   否则 `enable` 之后每轮收割都会 SQL 报错。
+        fts_table = str(getattr(getattr(self._cfg, "search", None),
+                                "messages_fts_table", "") or "")
+        main_sql = (
+            "INSERT INTO dsh_message "
+            "(guid, session_id, source_gens, line_no, block_path, seq, ev_type, "
+            " kind, role, turn, ev_time, cwd, ordinal, is_shadowed, is_index, "
+            " body, body_sha256, body_bytes) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?) "
+            "ON DUPLICATE KEY UPDATE body=VALUES(body), ev_time=VALUES(ev_time), "
+            "  body_sha256=VALUES(body_sha256), body_bytes=VALUES(body_bytes)"
+        ) if fts_table else (
+            "INSERT INTO dsh_message "
+            "(guid, session_id, source_gens, line_no, block_path, seq, ev_type, "
+            " kind, role, turn, ev_time, cwd, ordinal, is_shadowed, is_index, "
+            " body, body_sha256, body_bytes, body_tokenized) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?) "
+            "ON DUPLICATE KEY UPDATE body=VALUES(body), ev_time=VALUES(ev_time), "
+            "  body_sha256=VALUES(body_sha256), body_bytes=VALUES(body_bytes), "
+            "  body_tokenized=VALUES(body_tokenized)"
+        )
+        # ★ 2026-11-07 修既存 bug：原先 VALUES 里 is_shadowed 位写的是字面量 0、
+        #   is_index 位吃掉了一个 ?，导致**遮蔽标记全部落进 is_index**，
+        #   `is_shadowed` 20 万行恒为 0（compaction_v2.py 的注释记的就是这个症状）。
+        #   实测：含 ░ 的 1750 行全部 is_shadowed=0 / is_index=1，数量完全吻合。
+        #   现改为 is_shadowed 收真值、is_index 落字面量 0（无人读它）。
+        fts_sql = ("INSERT INTO " + fts_table + " (guid, body_tokenized) VALUES (?,?) "
+                   "ON DUPLICATE KEY UPDATE body_tokenized=VALUES(body_tokenized)")
         with self._db.cursor(readonly=False) as cur:
             for i in range(0, len(rows), BATCH_ROWS):
                 batch = rows[i:i + BATCH_ROWS]
-                cur.executemany(
-                    """INSERT INTO dsh_message
-                       (guid, session_id, source_gens, line_no, block_path, seq, ev_type,
-                        kind, role, turn, ev_time, cwd, ordinal, is_shadowed, is_index,
-                        body, body_sha256, body_bytes, body_tokenized)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?)
-                       ON DUPLICATE KEY UPDATE body=VALUES(body), ev_time=VALUES(ev_time),
-                         body_sha256=VALUES(body_sha256), body_bytes=VALUES(body_bytes),
-                         body_tokenized=VALUES(body_tokenized)""",
-                    [(r["guid"], session_id, gens, r["line_no"], r["block_path"], r["seq"],
-                      r["ev_type"], r["kind"], r["role"], r["turn"], r["ev_time"], cwd,
-                      r["ordinal"], 1 if "\u2591" in (r["body"] or "") else 0,
-                      r["body"], r["body_sha256"], r["body_bytes"],
-                      tokenize_cjk_ub(r["body"] or "")) for r in batch],
-                )
+                # ★ 分词器统一用 **v2**：重建后的存量全是 v2 口径，
+                #   新行若还用 v1 会立刻产生「混合世代」（正是这次重建要消灭的毛病）。
+                toks = [tokenize_cjk_ub_v2(r["body"] or "") for r in batch]
+                base = [(r["guid"], session_id, gens, r["line_no"], r["block_path"], r["seq"],
+                         r["ev_type"], r["kind"], r["role"], r["turn"], r["ev_time"], cwd,
+                         r["ordinal"], 1 if "\u2591" in (r["body"] or "") else 0,
+                         r["body"], r["body_sha256"], r["body_bytes"]) for r in batch]
+                if fts_table:
+                    cur.executemany(main_sql, base)
+                    cur.executemany(fts_sql, [(r["guid"], t) for r, t in zip(batch, toks)])
+                else:
+                    cur.executemany(main_sql, [b + (t,) for b, t in zip(base, toks)])
                 n += len(batch)
         return n
 

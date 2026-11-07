@@ -324,6 +324,48 @@ class SearchConfig:
     rerank_retries: int = 3
     rerank_backoff_sec: float = 2.0
 
+    # ── 会话正文（messages 源）的取数口径（2026-11-07，DESIGN.md #8/#9/#10）──
+    # 事件白名单：**只有这些 ev_type 进「会话正文」检索**。
+    # 为什么是白名单不是黑名单：DSH 每次升级都可能新增控制面事件（本版 catalog 已 62 个
+    # 类型），黑名单会让新类型**默认自己漏进来**，症状是沉默的、延迟发作的。
+    # 升级适配：拿 packages/core/session/src/known-event-types.ts 与本表做差集。
+    messages_ev_types: tuple = (
+        "user/message",
+        "assistant/message",
+        "tool/result",
+        "tool/call",
+        "tool/ptc-dispatch",
+    )
+    # inbox 回声的取数档位：
+    #   off  —— 不查 agent/inbox/spliced（默认；它与 user/message 是同一 UserMessage 的
+    #           两条记录，99.9% 逐字相同）
+    #   only —— 只查 splice（用于捞「改口前的原话」：被取消的消息只以 splice 形式存在）
+    #   both —— 两边都查（会看到成对重复）
+    inbox: str = "off"
+    # ── 垂直分表（DESIGN.md「下一版架构」）────────────────────────────
+    # 空串 = 与主表同表（当前形态，行为不变）。填了就切到侧表模式。
+    # 为什么把表名放配置而不是写死：迁移要能**先建表、后切代码**，
+    # 中间任何一刻两侧都得能跑。
+    messages_fts_table: str = ""     # 存 body_tokenized + FULLTEXT 索引的侧表
+    messages_vec_table: str = ""     # 存 embedding + VECTOR 索引的侧表
+    # 查询侧停止词：剥掉疑问框架词与虚词后再切 bigram。
+    # ★ 不放指代词（那个/这段/这种）—— 实测删它们反而让噪声行挤进前排。
+    stopwords: tuple = (
+        "可不可以", "能不能", "是不是", "有没有", "要不要", "会不会", "算不算",
+        "对不对", "行不行", "为什么", "为啥", "为何", "怎么样", "怎么", "怎样",
+        "如何", "什么", "哪些", "哪个", "哪里", "哪儿", "多少",
+        "之前", "以前", "上次", "那次", "刚才", "那会",
+        "关于", "对于", "只要", "哪怕", "但是", "虽然", "由于", "除了", "根据",
+        "通过", "按照", "针对", "围绕", "而且", "不过", "所以", "因为", "如果",
+        "就是", "还是", "或者", "以及", "还有", "然后", "的话", "等等",
+        "一个", "一下", "一些", "有点", "真的", "其实", "到底", "究竟", "一定", "肯定",
+        "问题", "东西", "事情", "玩意",
+        "我", "你", "他", "它", "们", "的", "了", "吗", "呢", "吧", "啊", "呀", "哦",
+        "嗯", "着", "过", "地", "得", "和", "与", "在", "是", "有", "把", "被", "让",
+        "给", "对", "从", "到", "就", "也", "都", "还", "又", "再", "才", "很", "太",
+        "更", "最", "真", "要", "会", "能", "说", "找", "看", "聊",
+    )
+
 
 @dataclass
 class BridgeConfig:
@@ -342,6 +384,29 @@ class BridgeConfig:
 
 
 @dataclass
+class MaintenanceConfig:
+    """升级窗口标志 —— 给「后来的程序」指路，而不只是给人看。
+
+    为什么需要它：本项目的表结构变更（重算 tokenized / 重建 FULLTEXT / 加 VECTOR 索引）
+    都是**小时级整表 rebuild**。窗口内如果收割器还在写、或检索侧还在读半成品表，
+    就会造出「看起来正常、其实是脏的」结果 —— 这正是本项目最忌讳的静默降级。
+
+    三个作用（缺一个都只算装饰）：
+      ① 收割器自己停（`harvest_enabled=false`）—— 不依赖「人记得关 DSH」；
+      ② 误启动的 MCP 能看见「正在升级」并如实告警（`enabled=true` ⇒ 检索结果带 note）；
+      ③ 后来的人/程序一眼知道**谁在动、为什么、从什么时候起**（reason / since）。
+
+    ★ 默认全关 —— 不加这个段落时行为与从前完全一致。
+    """
+
+    enabled: bool = False
+    reason: str = ""            # 谁在动、动什么（人读的）
+    since: str = ""             # ISO 时间戳
+    harvest_enabled: bool = True   # false ⇒ 定时器与启动扫都跳过
+    messages_table: str = ""    # 非空 ⇒ 会话正文源改读这张表（给误启动的 MCP 用）
+
+
+@dataclass
 class Config:
     """总配置。"""
 
@@ -351,6 +416,7 @@ class Config:
     harvest: HarvestConfig = field(default_factory=HarvestConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
     bridge: BridgeConfig = field(default_factory=BridgeConfig)
+    maintenance: MaintenanceConfig = field(default_factory=MaintenanceConfig)
 
     # ── 派生 ──
 
@@ -393,6 +459,7 @@ class Config:
         cfg._apply(raw.get("dsh"), cfg.dsh)
         cfg._apply(raw.get("harvest"), cfg.harvest)
         cfg._apply(raw.get("search"), cfg.search)
+        cfg._apply(raw.get("maintenance"), cfg.maintenance)
         _validate_rerank_tables(cfg.search)
         return cfg
 

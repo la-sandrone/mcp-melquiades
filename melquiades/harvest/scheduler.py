@@ -43,6 +43,7 @@ class HarvestScheduler:
         self._thread: Optional[threading.Thread] = None
         self._wait_timeout = float(stop_wait_timeout_sec)
         self._last: Optional[HarvestStats] = None
+        self._maint_warned = False
 
     # ── 生命周期 ──
 
@@ -95,12 +96,37 @@ class HarvestScheduler:
 
     # ── 循环 ──
 
+    def _harvest_allowed(self) -> bool:
+        """读配置里的升级标志。读不到就**允许**（默认行为不变）。"""
+        try:
+            cfg = getattr(self._runner, "_cfg", None)
+            m = getattr(cfg, "maintenance", None)
+            if m is None:
+                return True
+            if not getattr(m, "harvest_enabled", True):
+                if not self._maint_warned:
+                    logger.warning(
+                        "harvest paused by maintenance flag: enabled=%s reason=%r since=%s",
+                        getattr(m, "enabled", None), getattr(m, "reason", ""), getattr(m, "since", ""),
+                    )
+                    self._maint_warned = True
+                return False
+            return True
+        except Exception:  # noqa: BLE001 —— 体检不能反过来搞死收割
+            return True
+
     def _loop(self) -> None:
         """可中断睡眠 + 单轮收割。异常一律吞掉并记日志（绝不冒泡）。"""
         while not self._stop.is_set():
             # 可中断等待：stop 后立即醒来（等价 C 的 WaitForSingleObject 超时）
             if self._stop.wait(self._interval):
                 break
+            # ★ 升级窗口自停（DESIGN.md #18~#28）：配置里 maintenance.enabled=true 时，
+            #   收割器**自己**不写库 —— 不依赖「人记得关 DSH」。
+            #   为什么必须在这里挡：窗口内表结构正在重建，写进去的行会落到
+            #   即将被 RENAME 走的旧表上，切换后表现为「最新几分钟的内容消失」。
+            if not self._harvest_allowed():
+                continue
             try:
                 stats = self._runner.run_once("timer", stop_event=self._stop)
                 self._last = stats

@@ -681,7 +681,10 @@ def archive_find(query: str = "", mode: str = MODE_AUTO, limit: int = 0,
         "  sources:          限定源，逗号分隔：draftpad / messages / compactions；缺省全搜。\n"
         "  modes:            限定路，逗号分隔：vector / fulltext / like；缺省三路全开。\n"
         "                    关掉 like 能省时间——会话正文的 LIKE 是 14 万行全表扫（约 1–3 秒）。\n"
-        "  per_source_limit: 覆盖每路取数（一般不用传，默认跟随 limit）。\n\n"
+        "  per_source_limit: 覆盖每路取数（一般不用传，默认跟随 limit）。\n"
+        "  workspace:        off(默认) / boost(同工作区加权 ×1.25) / filter(只要本工作区)。\n"
+        "                    跨工作区找回是常态，**默认不要传 filter**。\n"
+        "  cwd:              当前工作区路径（配合 workspace 用；不传则不做工作区处理）。\n\n"
         "能力边界（必须知道，否则会误判『库里没有』）:\n"
         "  · 会话正文（dsh_message）**没有向量列**，该源只走全文+LIKE；\n"
         "    语义（模糊）召回由草稿纸与压缩摘要承担。\n"
@@ -699,7 +702,8 @@ def archive_find(query: str = "", mode: str = MODE_AUTO, limit: int = 0,
     )
 )
 def search_OMNIA(query: str = "", limit: int = 5, sources: str = "",
-                 modes: str = "", per_source_limit: int = 0) -> str:
+                 modes: str = "", per_source_limit: int = 0,
+                 workspace: str = "", cwd: str = "") -> str:
     assert _retriever is not None
     srcs = [s.strip() for s in (sources or "").split(",") if s.strip()]
     mds = [m.strip() for m in (modes or "").split(",") if m.strip()]
@@ -712,6 +716,8 @@ def search_OMNIA(query: str = "", limit: int = 5, sources: str = "",
             sources=srcs or list(OMNIA_DEFAULT_SOURCES),
             modes=mds or list(OMNIA_DEFAULT_MODES),
             per_source_limit=ps,
+            workspace_mode=(workspace or "").strip() or "off",
+            current_cwd=(cwd or "").strip(),
         )
         return omnia_format(res)
     except Exception as exc:  # noqa: BLE001
@@ -787,8 +793,19 @@ def _message_context_text(db, guid: str = "", before: int = 3, after: int = 3,
     except Exception as exc:  # noqa: BLE001
         return f"ERROR: {type(exc).__name__}: {exc}"
 
+    # ★ 抬头带「工作区 › 会话标题 › session id」（DESIGN.md #25）：
+    #   只给裸 session_id 时，人看不懂、LLM 也判断不了「这是哪一场」。
+    #   元信息取不到就如实标「未分类工作区」，**绝不猜**。
+    label = head["session_id"]
+    try:
+        from melquiades.session_meta import get_index as _meta_index
+        _mi = _meta_index(getattr(_cfg, "dsh_home", None),
+                          getattr(getattr(_cfg, "dsh", None), "harness_dir", None))
+        label = _mi.get(head["session_id"]).describe()
+    except Exception:  # noqa: BLE001 —— 元信息失败不能拖垮 context
+        pass
     lines = [
-        f"会话 {head['session_id']} · 目标 L{target} · "
+        f"会话 {label} · 目标 L{target} · "
         f"取回 {len(rows)} 条（前 {len(back) - 1} / 后 {len(fwd)}）",
         "",
     ]
@@ -1142,9 +1159,19 @@ def _init_state(config_path: str) -> None:
 
     _retriever = Retriever(_cfg, _db)
     _store = HarvestStore(_db)
-    _store.ensure_tables()
-    vec_status = ensure_all_vectors(_db)
-    logger.info("vector columns: %s", vec_status)
+    # ★ 升级窗口内**绝不跑 DDL**（DESIGN.md #29）：
+    #   ensure_tables / ensure_all_vectors 会 ALTER 表，而窗口里表正在被重建，
+    #   两者相撞轻则互相等待，重则把重建中的表结构改坏。
+    _maint = getattr(_cfg, "maintenance", None)
+    if _maint is not None and getattr(_maint, "enabled", False):
+        logger.warning(
+            "MAINTENANCE MODE: enabled=true reason=%r since=%s —— 跳过 ensure_tables / "
+            "ensure_all_vectors，且不启动收割；检索将返回维护提示",
+            getattr(_maint, "reason", ""), getattr(_maint, "since", ""))
+    else:
+        _store.ensure_tables()
+        vec_status = ensure_all_vectors(_db)
+        logger.info("vector columns: %s", vec_status)
 
     _runner = HarvestRunner(_cfg, _store, _retriever)
 
@@ -1161,6 +1188,12 @@ def _start_triggers() -> None:
     """启动三触发中的两个常驻项（第三个是工具搭车，见 _piggyback）。"""
     global _scheduler
     assert _cfg is not None and _runner is not None
+
+    # ★ 维护窗口：启动扫与定时器**都不起**（DESIGN.md #29）
+    _maint = getattr(_cfg, "maintenance", None)
+    if _maint is not None and getattr(_maint, "enabled", False):
+        logger.warning("MAINTENANCE MODE: 不启动启动扫与收割定时器")
+        return
 
     # C. 启动扫（增量，后台线程，不阻塞 MCP initialize）
     if _cfg.dsh.startup_scan_enabled:
